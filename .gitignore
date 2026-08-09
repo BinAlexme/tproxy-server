@@ -1,0 +1,7 @@
+/tproxy-server
+/config.json
+/profiles.json
+/coverage.out
+/*.test
+/*.prof
+.DS_Store

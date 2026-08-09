@@ -1,0 +1,60 @@
+{
+	email {$ACME_EMAIL}
+	admin off
+	servers {
+		protocols h1 h2
+	}
+}
+
+{$TPROXY_HOSTNAME} {
+	@relay path / /api/v1/*
+	handle @relay {
+		reverse_proxy 127.0.0.1:8080 {
+			transport http {
+				response_header_timeout 40s
+			}
+		}
+	}
+
+	handle {
+		encode zstd gzip
+		header {
+			Cache-Control "public, max-age=300"
+			Content-Security-Policy "default-src 'self'; style-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+			Permissions-Policy "camera=(), microphone=(), geolocation=()"
+			Referrer-Policy "strict-origin-when-cross-origin"
+			X-Content-Type-Options "nosniff"
+			X-Frame-Options "DENY"
+		}
+		root * {$TPROXY_SITE_ROOT}
+		@favicon path /favicon.ico
+		rewrite @favicon /favicon.svg
+		try_files {path} {path}.html {path}/index.html =404
+		file_server
+	}
+
+	handle_errors {
+		header {
+			Cache-Control "public, max-age=300"
+			Content-Security-Policy "default-src 'self'; style-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+			Permissions-Policy "camera=(), microphone=(), geolocation=()"
+			Referrer-Policy "strict-origin-when-cross-origin"
+			X-Content-Type-Options "nosniff"
+			X-Frame-Options "DENY"
+		}
+		root * {$TPROXY_SITE_ROOT}
+		@root_failure expression `{http.request.uri.path} == "/"`
+		handle @root_failure {
+			rewrite * /index.html
+			file_server {
+				status 200
+			}
+		}
+		handle {
+			rewrite * /404.html
+			file_server {
+				status 404
+			}
+		}
+	}
+}

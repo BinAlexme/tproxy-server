@@ -1,0 +1,13 @@
+[Unit]
+Description=Configure local proxy backend ports
+Before=mtproxy.service tproxy-server.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=-/usr/sbin/nft delete table inet tproxy_backend
+ExecStart=/usr/sbin/nft -f /etc/tproxy-server/firewall.nft
+ExecStop=-/usr/sbin/nft delete table inet tproxy_backend
+
+[Install]
+WantedBy=multi-user.target
