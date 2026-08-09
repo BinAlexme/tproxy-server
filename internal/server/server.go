@@ -220,6 +220,12 @@ func (s *Server) serveUp(w http.ResponseWriter, r *http.Request, token string) {
 	}
 	ack, err := value.ProcessUp(sequence, body)
 	if err != nil {
+		if errors.Is(err, session.ErrBackpressure) {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		s.serveNotFound(w)
 		return
 	}

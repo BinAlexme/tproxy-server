@@ -172,6 +172,7 @@ TPROXY_HOSTNAME="$hostname" TPROXY_SITE_ROOT=/srv/tproxy-site ACME_EMAIL="$email
 systemctl daemon-reload
 systemctl enable --now tproxy-firewall.service
 systemctl enable --now mtproxy.service
+systemctl restart mtproxy.service
 systemctl enable --now tproxy-server.service
 systemctl enable --now refresh-mtproxy-config.timer
 systemctl enable --now caddy.service

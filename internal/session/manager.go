@@ -17,6 +17,7 @@ import (
 
 var (
 	ErrAuthentication = errors.New("authentication failed")
+	ErrBackpressure   = errors.New("temporary backpressure")
 	ErrLimit          = errors.New("resource limit reached")
 	ErrProtocol       = errors.New("protocol error")
 	ErrConcurrent     = errors.New("concurrent request")
@@ -330,16 +331,36 @@ func (m *Manager) sessionFinished(value *Session) {
 	m.sessionsClosed.Add(1)
 }
 
-func (m *Manager) changePendingBudget(costDelta, itemDelta int) bool {
+func (m *Manager) changePendingBudget(
+	costDelta, itemDelta int,
+	class pendingClass) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if costDelta > 0 && (m.pendingGlobalCost > int64(m.config.Limits.MaxPendingGlobal-costDelta)) {
-		m.limitHits.Add(1)
-		return false
-	}
-	if itemDelta > 0 && (m.pendingGlobalItems > int64(m.config.Limits.MaxPendingItemsGlobal-itemDelta)) {
-		m.limitHits.Add(1)
-		return false
+	if costDelta > 0 || itemDelta > 0 {
+		costLimit := m.config.Limits.MaxPendingGlobal
+		itemLimit := m.config.Limits.MaxPendingItemsGlobal
+		if class != pendingControl {
+			reserveCost, reserveItems := pendingControlReserve(m.config.Limits)
+			sessions := m.config.Limits.MaxSessionsGlobal
+			if reserveCost > costLimit/sessions {
+				costLimit = 0
+			} else {
+				costLimit -= reserveCost * sessions
+			}
+			if reserveItems > itemLimit/sessions {
+				itemLimit = 0
+			} else {
+				itemLimit -= reserveItems * sessions
+			}
+		}
+		if costDelta > costLimit || m.pendingGlobalCost > int64(costLimit-costDelta) {
+			m.limitHits.Add(1)
+			return false
+		}
+		if itemDelta > itemLimit || m.pendingGlobalItems > int64(itemLimit-itemDelta) {
+			m.limitHits.Add(1)
+			return false
+		}
 	}
 	m.pendingGlobalCost += int64(costDelta)
 	m.pendingGlobalItems += int64(itemDelta)

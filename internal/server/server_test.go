@@ -134,6 +134,68 @@ func TestAPIRejectsWrongOriginAsPublic404(t *testing.T) {
 	}
 }
 
+func TestUplinkBackpressureIsRetryable(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Limits.MaxStreamsPerSession = 1
+		value.Limits.MaxPendingPerSession = 5500
+		value.Limits.MaxPendingItemsPerSession = 64
+	})
+	defer application.Shutdown()
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	clientIP := "198.51.100.7"
+	bootstrap, err := application.manager.IssueBootstrap(
+		&application.config.Profiles[0],
+		clientIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := application.manager.Create(
+		bootstrap,
+		clientIP,
+		frame.Encode(frame.Hello, 0, []byte{1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := append(
+		frame.Encode(frame.Open, 23, nil),
+		frame.Encode(frame.Data, 23, bytes.Repeat([]byte{1}, 512))...)
+	upRequest := apiRequest(
+		t,
+		http.MethodPost,
+		hosted.URL+"/api/v1/up",
+		created.Token,
+		body)
+	upRequest.Header.Set("X-Up-Seq", "1")
+	response := perform(t, hosted.Client(), upRequest)
+	_ = readResponse(t, response)
+	if response.StatusCode != http.StatusServiceUnavailable ||
+		response.Header.Get("Retry-After") != "1" ||
+		response.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("backpressure response was not retryable: status=%d", response.StatusCode)
+	}
+	if _, err := application.manager.Get(created.Token); err != nil {
+		t.Fatal("backpressure invalidated the session token")
+	}
+
+	retry := apiRequest(
+		t,
+		http.MethodPost,
+		hosted.URL+"/api/v1/up",
+		created.Token,
+		frame.Encode(frame.Open, 23, nil))
+	retry.Header.Set("X-Up-Seq", "1")
+	retried := perform(t, hosted.Client(), retry)
+	_ = readResponse(t, retried)
+	if retried.StatusCode != http.StatusNoContent ||
+		retried.Header.Get("X-Up-Ack") != "1" {
+		t.Fatalf("uncommitted sequence was not retryable: status=%d", retried.StatusCode)
+	}
+}
+
 func TestAdminSurfaceIsSeparate(t *testing.T) {
 	backend := startEchoBackend(t)
 	application, _ := newTestServer(t, backend)
@@ -160,6 +222,13 @@ func TestAdminSurfaceIsSeparate(t *testing.T) {
 }
 
 func newTestServer(t *testing.T, backend string) (*Server, []byte) {
+	return newConfiguredTestServer(t, backend, nil)
+}
+
+func newConfiguredTestServer(
+	t *testing.T,
+	backend string,
+	configure func(*config.Config)) (*Server, []byte) {
 	t.Helper()
 	directory := t.TempDir()
 	index := []byte("<!doctype html><title>Quiet Systems</title><p>ordinary site</p>")
@@ -175,6 +244,9 @@ func newTestServer(t *testing.T, backend string) (*Server, []byte) {
 	value.PublicDir = directory
 	value.Timeouts.LongPoll = config.Duration(500 * time.Millisecond)
 	value.Timeouts.BackendDial = config.Duration(time.Second)
+	if configure != nil {
+		configure(&value)
+	}
 	secret, _ := hex.DecodeString("000102030405060708090a0b0c0d0e0f")
 	value.Profiles = []config.Profile{{
 		Name:       "default",

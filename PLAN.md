@@ -341,6 +341,9 @@ Rules:
   recently committed sequence;
 - the server commits the sequence only after all frames pass validation and are
   accepted by bounded stream queues;
+- if a valid next batch cannot temporarily fit the DATA queue partition, the server
+  applies none of it, leaves the sequence uncommitted, and returns retryable `503`
+  with `Retry-After: 1`;
 - a duplicate is acknowledged without applying its frames again;
 - gaps, reordered sequences, or a duplicate with different bytes terminate the
   session as a protocol error.
@@ -648,6 +651,9 @@ Additional requirements:
   idle deadlines, and graceful-shutdown deadlines; do not apply the short header
   deadline to a complete 2 MiB carrier upload;
 - reject multiple concurrent uplinks or downlinks for one session;
+- reserve room for one uplink batch plus byte and item headroom for relay-to-client
+  control frames, coalesce pending WINDOW grants per stream, and pause backend DATA
+  reads before they consume either reserve;
 - cap goroutines and open backend connections through the session/stream limits;
 - disable CORS and validate same-origin POST requests;
 - never log bridge URLs, queries, bearer tokens, frame payloads, MTProxy bytes, or

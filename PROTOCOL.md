@@ -74,6 +74,11 @@ Body: one or more complete frames
 X-Up-Ack: 1
 ```
 
+If the next valid batch cannot yet fit the relay's DATA queue budget, the relay
+returns `503 Service Unavailable` with `Retry-After: 1`. The sequence remains
+uncommitted and no frame from the batch is applied. The bridge retries the same
+sequence with the byte-identical body.
+
 One downlink poll may be active. The cursor acknowledges a previously delivered
 batch. Repeating the old cursor replays the unacknowledged batch byte-for-byte:
 
@@ -125,7 +130,11 @@ Pending limits charge encoded bytes plus a conservative 256-byte cost for every
 queued write or frame. Separate item limits remain authoritative even when adjacent
 writes or WINDOW updates cannot be coalesced. Moving frames into the one replayable
 downlink batch retains their byte and item charges until the next cursor acknowledges
-that batch.
+that batch. Downlink DATA admission leaves room for one maximum uplink batch and
+reserved byte and item headroom for WINDOW, CLOSE, and session control frames.
+WINDOW grants for one stream coalesce while pending even when other streams' controls
+are interleaved. Backend reads pause when the downlink DATA partition is full and
+resume after a downlink acknowledgement releases capacity.
 
 An `OPEN` creates exactly one connection to the profile's configured numeric
 loopback backend. The client cannot select a destination. Stream IDs cannot be

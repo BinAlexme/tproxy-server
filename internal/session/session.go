@@ -16,14 +16,26 @@ import (
 	"github.com/telegramdesktop/tproxy-server/internal/frame"
 )
 
-const queueItemCost = 256
+const (
+	queueItemCost                = 256
+	controlReserveExtraItems     = 16
+	controlReserveItemsPerStream = 3
+)
+
+type pendingClass byte
+
+const (
+	pendingUplink pendingClass = iota
+	pendingDownlink
+	pendingControl
+)
 
 type sessionOptions struct {
 	profile    *config.Profile
 	clientIP   string
 	limits     config.Limits
 	timeouts   config.Timeouts
-	budget     func(int, int) bool
+	budget     func(int, int, pendingClass) bool
 	onFinished func(*Session)
 	onStream   func()
 	onUp       func(int)
@@ -65,7 +77,7 @@ type Session struct {
 	clientIP string
 	limits   config.Limits
 	timeouts config.Timeouts
-	budget   func(int, int) bool
+	budget   func(int, int, pendingClass) bool
 
 	mu             sync.Mutex
 	streams        map[uint32]*streamState
@@ -73,6 +85,7 @@ type Session struct {
 	closedOrder    []uint32
 	closedStart    int
 	pendingFrames  []queuedFrame
+	pendingWindows map[uint32]int
 	pendingCost    int
 	pendingItems   int
 	unacked        []byte
@@ -87,6 +100,7 @@ type Session struct {
 	closed         bool
 	lastActivity   time.Time
 	notify         chan struct{}
+	budgetNotify   chan struct{}
 	done           chan struct{}
 	finishOnce     sync.Once
 	backendWG      sync.WaitGroup
@@ -98,20 +112,22 @@ type Session struct {
 
 func newSession(options sessionOptions) *Session {
 	return &Session{
-		profile:       options.profile,
-		clientIP:      options.clientIP,
-		limits:        options.limits,
-		timeouts:      options.timeouts,
-		budget:        options.budget,
-		streams:       make(map[uint32]*streamState),
-		closedStreams: make(map[uint32]struct{}),
-		lastActivity:  time.Now(),
-		notify:        make(chan struct{}, 1),
-		done:          make(chan struct{}),
-		onFinished:    options.onFinished,
-		onStream:      options.onStream,
-		onUp:          options.onUp,
-		onDown:        options.onDown,
+		profile:        options.profile,
+		clientIP:       options.clientIP,
+		limits:         options.limits,
+		timeouts:       options.timeouts,
+		budget:         options.budget,
+		streams:        make(map[uint32]*streamState),
+		closedStreams:  make(map[uint32]struct{}),
+		pendingWindows: make(map[uint32]int),
+		lastActivity:   time.Now(),
+		notify:         make(chan struct{}, 1),
+		budgetNotify:   make(chan struct{}),
+		done:           make(chan struct{}),
+		onFinished:     options.onFinished,
+		onStream:       options.onStream,
+		onUp:           options.onUp,
+		onDown:         options.onDown,
 	}
 }
 
@@ -165,16 +181,18 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 		s.protocolFailure()
 		return 0, ErrProtocol
 	}
-	opened, closed, applied := s.applyBatchLocked(frames)
-	if !applied {
+	reservedCost, reservedItems := s.backendWriteReservationLocked(frames)
+	if (reservedCost != 0 || reservedItems != 0) &&
+		!s.reservePendingLocked(reservedCost, reservedItems, pendingUplink) {
 		s.mu.Unlock()
-		for _, value := range closed {
-			value.close()
-		}
-		for _, value := range opened {
-			value.close()
-		}
-		return 0, ErrLimit
+		return 0, ErrBackpressure
+	}
+	opened, closed, unusedCost, unusedItems := s.applyBatchLocked(
+		frames,
+		reservedCost,
+		reservedItems)
+	if unusedCost != 0 || unusedItems != 0 {
+		s.releasePendingLocked(unusedCost, unusedItems)
 	}
 	s.backendWG.Add(len(opened))
 	s.lastUpSequence = sequence
@@ -355,7 +373,41 @@ func (s *Session) validateBatchLocked(values []frame.Frame) bool {
 	return true
 }
 
-func (s *Session) applyBatchLocked(values []frame.Frame) ([]*backendStream, []*backendStream, bool) {
+func (s *Session) backendWriteReservationLocked(
+	values []frame.Frame) (int, int) {
+	live := make(map[uint32]bool, len(s.streams))
+	for id := range s.streams {
+		live[id] = true
+	}
+	cost := 0
+	items := 0
+	for _, value := range values {
+		if value.StreamID == 0 {
+			continue
+		}
+		switch value.Type {
+		case frame.Open:
+			live[value.StreamID] = true
+		case frame.Data:
+			if live[value.StreamID] {
+				cost += len(value.Payload) + queueItemCost
+				items++
+			}
+		case frame.Close:
+			delete(live, value.StreamID)
+		}
+	}
+	return cost, items
+}
+
+func (s *Session) applyBatchLocked(
+	values []frame.Frame,
+	reservedCost int,
+	reservedItems int) (
+	[]*backendStream,
+	[]*backendStream,
+	int,
+	int) {
 	opened := make([]*backendStream, 0)
 	closed := make([]*backendStream, 0)
 	for _, value := range values {
@@ -383,10 +435,9 @@ func (s *Session) applyBatchLocked(values []frame.Frame) ([]*backendStream, []*b
 			if wasClosed {
 				continue
 			}
-			if !s.queueBackendWriteLocked(state, value.Payload) {
-				s.closeLocked()
-				return opened, closed, false
-			}
+			cost, items := s.appendBackendWriteLocked(state, value.Payload)
+			reservedCost -= cost
+			reservedItems -= items
 			state.receiveWindow -= uint32(len(value.Payload))
 			signal(state.writeNotify)
 		case frame.Window:
@@ -409,19 +460,18 @@ func (s *Session) applyBatchLocked(values []frame.Frame) ([]*backendStream, []*b
 			closed = append(closed, state.backend)
 		}
 	}
-	return opened, closed, true
+	return opened, closed, reservedCost, reservedItems
 }
 
-func (s *Session) queueBackendWriteLocked(state *streamState, payload []byte) bool {
+func (s *Session) appendBackendWriteLocked(
+	state *streamState,
+	payload []byte) (int, int) {
 	cost := len(payload) + queueItemCost
 	items := 1
 	coalesce := len(state.writes) != 0 && len(state.writes[len(state.writes)-1])+len(payload) <= frame.DataChunk
 	if coalesce {
 		cost = len(payload)
 		items = 0
-	}
-	if !s.reservePendingLocked(cost, items) {
-		return false
 	}
 	if coalesce {
 		last := len(state.writes) - 1
@@ -432,7 +482,7 @@ func (s *Session) queueBackendWriteLocked(state *streamState, payload []byte) bo
 	state.pendingWriteBytes += len(payload)
 	state.pendingWriteCost += cost
 	state.pendingWriteItems += items
-	return true
+	return cost, items
 }
 
 func (s *Session) nextWrite(id uint32, done <-chan struct{}) ([]byte, bool) {
@@ -478,7 +528,6 @@ func (s *Session) backendDrained(id uint32, amount int) bool {
 	s.releasePendingLocked(amount, 0)
 	state.receiveWindow += uint32(amount)
 	if !s.queueFrameLocked(frame.Window, id, frame.WindowPayload(uint32(amount))) {
-		s.closeLocked()
 		return false
 	}
 	return true
@@ -514,13 +563,18 @@ func (s *Session) nextReadAllowance(id uint32, done <-chan struct{}) (int, bool)
 			if result > frame.DataChunk {
 				result = frame.DataChunk
 			}
-			s.mu.Unlock()
-			return result, true
+			result = s.dataFrameAllowanceLocked(result)
+			if result != 0 {
+				s.mu.Unlock()
+				return result, true
+			}
 		}
 		notify := state.creditNotify
+		budgetNotify := s.budgetNotify
 		s.mu.Unlock()
 		select {
 		case <-notify:
+		case <-budgetNotify:
 		case <-s.done:
 			return 0, false
 		case <-done:
@@ -538,7 +592,6 @@ func (s *Session) backendData(id uint32, data []byte) bool {
 	}
 	state.sendCredit -= uint64(len(data))
 	if !s.queueFrameLocked(frame.Data, id, data) {
-		s.closeLocked()
 		return false
 	}
 	return true
@@ -560,20 +613,29 @@ func (s *Session) backendClosed(id uint32, backend *backendStream) {
 }
 
 func (s *Session) queueFrameLocked(t frame.Type, id uint32, payload []byte) bool {
-	if len(s.pendingFrames) != 0 {
-		last := &s.pendingFrames[len(s.pendingFrames)-1]
-		if last.typeCode == frame.Window && t == frame.Window && last.streamID == id {
-			previous, _ := frame.WindowAmount(last.encoded[frame.HeaderSize:])
+	if t == frame.Window {
+		if index, exists := s.pendingWindows[id]; exists {
+			queued := &s.pendingFrames[index]
+			previous, _ := frame.WindowAmount(
+				queued.encoded[frame.HeaderSize:])
 			amount, _ := frame.WindowAmount(payload)
 			total := uint64(previous) + uint64(amount)
 			if total <= math.MaxUint32 {
-				binary.BigEndian.PutUint32(last.encoded[frame.HeaderSize:], uint32(total))
+				binary.BigEndian.PutUint32(
+					queued.encoded[frame.HeaderSize:],
+					uint32(total))
 				signal(s.notify)
 				return true
 			}
 		}
+	}
+	if len(s.pendingFrames) != 0 {
+		last := &s.pendingFrames[len(s.pendingFrames)-1]
 		if last.typeCode == frame.Data && t == frame.Data && last.streamID == id && len(last.encoded)-frame.HeaderSize+len(payload) <= s.limits.MaxFramePayload {
-			if !s.reservePendingLocked(len(payload), 0) {
+			if !s.reservePendingLocked(
+				len(payload),
+				0,
+				pendingDownlink) {
 				return false
 			}
 			last.encoded = append(last.encoded, payload...)
@@ -585,7 +647,11 @@ func (s *Session) queueFrameLocked(t frame.Type, id uint32, payload []byte) bool
 	}
 	encoded := frame.Encode(t, id, payload)
 	cost := len(encoded) + queueItemCost
-	if !s.reservePendingLocked(cost, 1) {
+	class := pendingControl
+	if t == frame.Data {
+		class = pendingDownlink
+	}
+	if !s.reservePendingLocked(cost, 1, class) {
 		return false
 	}
 	s.pendingFrames = append(s.pendingFrames, queuedFrame{
@@ -594,15 +660,101 @@ func (s *Session) queueFrameLocked(t frame.Type, id uint32, payload []byte) bool
 		streamID: id,
 		cost:     cost,
 	})
+	if t == frame.Window {
+		s.pendingWindows[id] = len(s.pendingFrames) - 1
+	}
 	signal(s.notify)
 	return true
 }
 
-func (s *Session) reservePendingLocked(cost, items int) bool {
-	if cost <= 0 || items < 0 || s.pendingCost > s.limits.MaxPendingPerSession-cost || s.pendingItems > s.limits.MaxPendingItemsPerSession-items {
+func pendingControlReserve(limits config.Limits) (int, int) {
+	items := controlReserveExtraItems
+	if limits.MaxStreamsPerSession > (math.MaxInt-items)/controlReserveItemsPerStream {
+		return limits.MaxPendingPerSession, limits.MaxPendingItemsPerSession
+	}
+	items += limits.MaxStreamsPerSession * controlReserveItemsPerStream
+	costPerItem := queueItemCost + frame.HeaderSize + 4
+	if items > math.MaxInt/costPerItem {
+		return limits.MaxPendingPerSession, limits.MaxPendingItemsPerSession
+	}
+	return items * costPerItem, items
+}
+
+func pendingUplinkReserve(limits config.Limits) (int, int) {
+	items := limits.MaxBodyBytes / frame.HeaderSize
+	if items > frame.MaxBatchFrames {
+		items = frame.MaxBatchFrames
+	}
+	if items > (math.MaxInt-limits.MaxBodyBytes)/queueItemCost {
+		return limits.MaxPendingPerSession, limits.MaxPendingItemsPerSession
+	}
+	return limits.MaxBodyBytes + items*queueItemCost, items
+}
+
+func subtractPendingReserve(
+	cost, items int,
+	reserveCost, reserveItems int) (int, int) {
+	if reserveCost >= cost {
+		cost = 0
+	} else {
+		cost -= reserveCost
+	}
+	if reserveItems >= items {
+		items = 0
+	} else {
+		items -= reserveItems
+	}
+	return cost, items
+}
+
+func (s *Session) uplinkPendingLimits() (int, int) {
+	reserveCost, reserveItems := pendingControlReserve(s.limits)
+	return subtractPendingReserve(
+		s.limits.MaxPendingPerSession,
+		s.limits.MaxPendingItemsPerSession,
+		reserveCost,
+		reserveItems)
+}
+
+func (s *Session) downlinkPendingLimits() (int, int) {
+	cost, items := s.uplinkPendingLimits()
+	reserveCost, reserveItems := pendingUplinkReserve(s.limits)
+	return subtractPendingReserve(
+		cost,
+		items,
+		reserveCost,
+		reserveItems)
+}
+
+func (s *Session) dataFrameAllowanceLocked(limit int) int {
+	costLimit, itemLimit := s.downlinkPendingLimits()
+	if s.pendingItems >= itemLimit {
+		return 0
+	}
+	available := costLimit - s.pendingCost - queueItemCost - frame.HeaderSize
+	if available <= 0 {
+		return 0
+	}
+	if limit > available {
+		limit = available
+	}
+	return limit
+}
+
+func (s *Session) reservePendingLocked(
+	cost, items int,
+	class pendingClass) bool {
+	costLimit := s.limits.MaxPendingPerSession
+	itemLimit := s.limits.MaxPendingItemsPerSession
+	if class == pendingUplink {
+		costLimit, itemLimit = s.uplinkPendingLimits()
+	} else if class == pendingDownlink {
+		costLimit, itemLimit = s.downlinkPendingLimits()
+	}
+	if cost <= 0 || items < 0 || cost > costLimit || items > itemLimit || s.pendingCost > costLimit-cost || s.pendingItems > itemLimit-items {
 		return false
 	}
-	if s.budget != nil && !s.budget(cost, items) {
+	if s.budget != nil && !s.budget(cost, items, class) {
 		return false
 	}
 	s.pendingCost += cost
@@ -625,10 +777,17 @@ func (s *Session) takeDownBatchLocked() downBatch {
 	}
 	result := make([]byte, 0, size)
 	for index := 0; index != count; index++ {
+		if s.pendingFrames[index].typeCode == frame.Window &&
+			s.pendingWindows[s.pendingFrames[index].streamID] == index {
+			delete(s.pendingWindows, s.pendingFrames[index].streamID)
+		}
 		result = append(result, s.pendingFrames[index].encoded...)
 		s.pendingFrames[index] = queuedFrame{}
 	}
 	s.pendingFrames = s.pendingFrames[count:]
+	for id, index := range s.pendingWindows {
+		s.pendingWindows[id] = index - count
+	}
 	if len(s.pendingFrames) == 0 {
 		s.pendingFrames = nil
 	}
@@ -670,8 +829,10 @@ func (s *Session) releasePendingLocked(cost, items int) {
 	s.pendingCost -= cost
 	s.pendingItems -= items
 	if s.budget != nil {
-		s.budget(-cost, -items)
+		s.budget(-cost, -items, pendingUplink)
 	}
+	close(s.budgetNotify)
+	s.budgetNotify = make(chan struct{})
 }
 
 func (s *Session) protocolFailure() {
@@ -692,12 +853,13 @@ func (s *Session) closeLocked() {
 	s.streams = nil
 	if s.pendingCost != 0 || s.pendingItems != 0 {
 		if s.budget != nil {
-			s.budget(-s.pendingCost, -s.pendingItems)
+			s.budget(-s.pendingCost, -s.pendingItems, pendingUplink)
 		}
 		s.pendingCost = 0
 		s.pendingItems = 0
 	}
 	s.pendingFrames = nil
+	s.pendingWindows = nil
 	s.unacked = nil
 	s.unackedCost = 0
 	s.unackedItems = 0

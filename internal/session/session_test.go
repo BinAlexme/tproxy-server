@@ -61,12 +61,18 @@ func TestRejectsStreamReuseAndWindowOverrun(t *testing.T) {
 }
 
 func TestPendingByteLimitIncludesBackendWrites(t *testing.T) {
-	manager, _, value := testSession(t)
+	manager, token, value := testSession(t)
 	defer manager.Shutdown()
 	value.limits.MaxPendingPerSession = 4
 	batch := append(frame.Encode(frame.Open, 9, nil), frame.Encode(frame.Data, 9, []byte("12345"))...)
-	if _, err := value.ProcessUp(1, batch); !errors.Is(err, ErrLimit) {
+	if _, err := value.ProcessUp(1, batch); !errors.Is(err, ErrBackpressure) {
 		t.Fatalf("backend write exceeded the pending-byte limit: %v", err)
+	}
+	if value.lastUpSequence != 0 {
+		t.Fatal("backpressured uplink committed its sequence")
+	}
+	if _, err := manager.Get(token); err != nil {
+		t.Fatal("backpressured uplink closed its session")
 	}
 }
 
@@ -75,7 +81,7 @@ func TestProcessPendingByteLimitIncludesBackendWrites(t *testing.T) {
 	defer manager.Shutdown()
 	manager.config.Limits.MaxPendingGlobal = 4
 	batch := append(frame.Encode(frame.Open, 10, nil), frame.Encode(frame.Data, 10, []byte("12345"))...)
-	if _, err := value.ProcessUp(1, batch); !errors.Is(err, ErrLimit) {
+	if _, err := value.ProcessUp(1, batch); !errors.Is(err, ErrBackpressure) {
 		t.Fatalf("backend write exceeded the process pending-byte limit: %v", err)
 	}
 }
@@ -87,7 +93,7 @@ func TestProcessPendingItemLimitIncludesBackendWrites(t *testing.T) {
 	batch := append(frame.Encode(frame.Open, 15, nil), frame.Encode(frame.Data, 15, []byte{1})...)
 	batch = append(batch, frame.Encode(frame.Open, 16, nil)...)
 	batch = append(batch, frame.Encode(frame.Data, 16, []byte{2})...)
-	if _, err := value.ProcessUp(1, batch); !errors.Is(err, ErrLimit) {
+	if _, err := value.ProcessUp(1, batch); !errors.Is(err, ErrBackpressure) {
 		t.Fatalf("backend writes exceeded the process pending-item limit: %v", err)
 	}
 }
@@ -99,8 +105,225 @@ func TestPendingItemLimitIncludesTinyWrites(t *testing.T) {
 	batch := append(frame.Encode(frame.Open, 11, nil), frame.Encode(frame.Data, 11, []byte{1})...)
 	batch = append(batch, frame.Encode(frame.Open, 12, nil)...)
 	batch = append(batch, frame.Encode(frame.Data, 12, []byte{2})...)
-	if _, err := value.ProcessUp(1, batch); !errors.Is(err, ErrLimit) {
+	if _, err := value.ProcessUp(1, batch); !errors.Is(err, ErrBackpressure) {
 		t.Fatalf("tiny writes exceeded the pending-item limit: %v", err)
+	}
+}
+
+func TestControlFramesUseReservedQueueHeadroom(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Limits.MaxStreamsPerSession = 1
+	configuration.Limits.MaxBodyBytes = 1024
+	configuration.Limits.MaxPendingPerSession = 64 * 1024
+	configuration.Limits.MaxPendingItemsPerSession = 256
+	configuration.Limits.MaxPendingGlobal = configuration.Limits.MaxPendingPerSession
+	configuration.Limits.MaxPendingItemsGlobal = configuration.Limits.MaxPendingItemsPerSession
+	configuration.Limits.MaxSessionsGlobal = 1
+	manager := NewManager(configuration)
+	defer manager.Shutdown()
+	value := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+		budget:   manager.changePendingBudget,
+	})
+	defer value.Close()
+
+	value.mu.Lock()
+	costLimit, itemLimit := value.downlinkPendingLimits()
+	if !value.reservePendingLocked(
+		costLimit,
+		itemLimit,
+		pendingDownlink) {
+		value.mu.Unlock()
+		t.Fatal("could not fill the data portion of the queue")
+	}
+	if value.queueFrameLocked(frame.Data, 1, []byte{1}) {
+		value.mu.Unlock()
+		t.Fatal("DATA consumed reserved control headroom")
+	}
+	if !value.queueFrameLocked(frame.Window, 1, frame.WindowPayload(1)) ||
+		!value.queueFrameLocked(frame.Close, 1, nil) {
+		value.mu.Unlock()
+		t.Fatal("control frame could not use reserved headroom")
+	}
+	closed := value.closed
+	value.mu.Unlock()
+	if closed {
+		t.Fatal("control headroom exhaustion closed the session")
+	}
+}
+
+func TestDownlinkBudgetPreservesOneUplinkBatch(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Limits.MaxStreamsPerSession = 1
+	configuration.Limits.MaxBodyBytes = 1024
+	configuration.Limits.MaxPendingPerSession = 64 * 1024
+	configuration.Limits.MaxPendingItemsPerSession = 256
+	value := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+		budget:   func(int, int, pendingClass) bool { return true },
+	})
+	defer func() {
+		value.Close()
+		value.wait()
+	}()
+
+	value.mu.Lock()
+	costLimit, itemLimit := value.downlinkPendingLimits()
+	if !value.reservePendingLocked(
+		costLimit,
+		itemLimit,
+		pendingDownlink) {
+		value.mu.Unlock()
+		t.Fatal("could not fill the downlink DATA partition")
+	}
+	value.mu.Unlock()
+
+	body := append(
+		frame.Encode(frame.Open, 21, nil),
+		frame.Encode(frame.Data, 21, bytes.Repeat([]byte{1}, 512))...)
+	ack, err := value.ProcessUp(1, body)
+	if err != nil || ack != 1 {
+		t.Fatalf("reserved uplink batch was rejected: ack=%d error=%v", ack, err)
+	}
+}
+
+func TestWindowFramesCoalesceAcrossOtherControlFrames(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	value := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+		budget:   func(int, int, pendingClass) bool { return true },
+	})
+	defer value.Close()
+
+	value.mu.Lock()
+	queued := value.queueFrameLocked(frame.Window, 1, frame.WindowPayload(2))
+	queued = queued && value.queueFrameLocked(frame.Close, 2, nil)
+	queued = queued && value.queueFrameLocked(frame.Window, 1, frame.WindowPayload(3))
+	count := len(value.pendingFrames)
+	value.mu.Unlock()
+	if !queued || count != 2 {
+		t.Fatalf("WINDOW frames were not coalesced: queued=%v count=%d", queued, count)
+	}
+
+	body, _, err := value.Poll(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames, err := frame.ParseAll(body, frame.MaxPayload)
+	if err != nil || len(frames) != 2 {
+		t.Fatalf("could not parse coalesced controls: frames=%v error=%v", frames, err)
+	}
+	amount, err := frame.WindowAmount(frames[0].Payload)
+	if err != nil || amount != 5 {
+		t.Fatalf("coalesced WINDOW amount is %d: %v", amount, err)
+	}
+}
+
+func TestDownlinkBudgetPausesBackendReads(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Limits.MaxStreamsPerSession = 1
+	configuration.Limits.MaxBodyBytes = 1024
+	configuration.Limits.MaxPendingPerSession = 64 * 1024
+	configuration.Limits.MaxPendingItemsPerSession = 256
+	value := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+		budget:   func(int, int, pendingClass) bool { return true },
+	})
+	defer value.Close()
+	backend := newBackendStream(value, 19, configuration.Profiles[0].Backend)
+	value.streams[19] = &streamState{
+		backend:      backend,
+		sendCredit:   frame.InitialStreamWindow,
+		creditNotify: make(chan struct{}, 1),
+		writeNotify:  make(chan struct{}, 1),
+	}
+
+	value.mu.Lock()
+	costLimit, itemLimit := value.downlinkPendingLimits()
+	if !value.reservePendingLocked(
+		costLimit,
+		itemLimit,
+		pendingDownlink) {
+		value.mu.Unlock()
+		t.Fatal("could not fill the data portion of the queue")
+	}
+	value.mu.Unlock()
+
+	result := make(chan int, 1)
+	go func() {
+		allowance, ok := value.nextReadAllowance(19, backend.ctx.Done())
+		if !ok {
+			result <- -1
+			return
+		}
+		result <- allowance
+	}()
+	select {
+	case allowance := <-result:
+		t.Fatalf("backend read was allowed against a full queue: %d", allowance)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	value.mu.Lock()
+	value.releasePendingLocked(1024, 1)
+	value.mu.Unlock()
+	select {
+	case allowance := <-result:
+		if allowance <= 0 || allowance > 1024-frame.HeaderSize-queueItemCost {
+			t.Fatalf("invalid resumed allowance: %d", allowance)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("backend read did not resume after queue capacity returned")
+	}
+}
+
+func TestDownlinkDataLimitDoesNotCloseSession(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Limits.MaxStreamsPerSession = 1
+	configuration.Limits.MaxBodyBytes = 1024
+	configuration.Limits.MaxPendingPerSession = 64 * 1024
+	configuration.Limits.MaxPendingItemsPerSession = 256
+	value := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+		budget:   func(int, int, pendingClass) bool { return true },
+	})
+	defer value.Close()
+	backend := newBackendStream(value, 20, configuration.Profiles[0].Backend)
+	value.streams[20] = &streamState{
+		backend:      backend,
+		sendCredit:   frame.InitialStreamWindow,
+		creditNotify: make(chan struct{}, 1),
+		writeNotify:  make(chan struct{}, 1),
+	}
+
+	value.mu.Lock()
+	costLimit, itemLimit := value.downlinkPendingLimits()
+	if !value.reservePendingLocked(
+		costLimit,
+		itemLimit,
+		pendingDownlink) {
+		value.mu.Unlock()
+		t.Fatal("could not fill the data portion of the queue")
+	}
+	value.mu.Unlock()
+	if value.backendData(20, []byte{1}) {
+		t.Fatal("backend DATA bypassed the data queue limit")
+	}
+	value.mu.Lock()
+	closed := value.closed
+	value.mu.Unlock()
+	if closed {
+		t.Fatal("one backpressured backend stream closed the session")
 	}
 }
 
@@ -110,7 +333,7 @@ func TestQueuedFramesChargeOverheadAndLimitBatchCount(t *testing.T) {
 		profile:  &config.Profile{},
 		limits:   value.Limits,
 		timeouts: value.Timeouts,
-		budget:   func(int, int) bool { return true },
+		budget:   func(int, int, pendingClass) bool { return true },
 	})
 	session.mu.Lock()
 	for id := uint32(1); id <= frame.MaxBatchFrames+7; id++ {
@@ -283,7 +506,7 @@ func TestStreamCancellationWakesZeroCreditWaiter(t *testing.T) {
 		profile:  &configuration.Profiles[0],
 		limits:   configuration.Limits,
 		timeouts: configuration.Timeouts,
-		budget:   func(int, int) bool { return true },
+		budget:   func(int, int, pendingClass) bool { return true },
 	})
 	backend := newBackendStream(value, 18, configuration.Profiles[0].Backend)
 	value.streams[18] = &streamState{
