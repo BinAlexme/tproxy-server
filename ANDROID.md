@@ -95,11 +95,38 @@ The proof of concept touches these areas in the cloned upstream source:
   loopback address while preserving the user's MTProxy secret for native tgnet.
 - `ProxySettingsActivity` exposes a third `WEB Proxy` choice, fixes the effective
   port to 443, validates a canonical DNS hostname and 16-byte or `dd` secret, and
-  does not offer an incompatible `t.me/proxy` share link.
+  shares the dedicated `t.me/webproxy` link type.
 - `ProxyListActivity` stores and displays the explicit type. Availability checks and
   automatic rotation skip WEB entries because checking one would activate a
   process-wide WebView carrier.
 - `androidx.webkit:webkit:1.14.0` provides the exact-origin binary message API.
+
+## Proxy links
+
+The canonical share link is:
+
+```text
+https://t.me/webproxy?server=proxy.example.com&secret=000102030405060708090a0b0c0d0e0f
+```
+
+`server` is the canonical DNS hostname and `secret` is the same client-facing
+16-byte or `dd`-prefixed MTProxy secret used by the relay profile. The link has no
+port because WEB always uses HTTPS on 443, and it has no username or password.
+Clients also accept `tg://webproxy?server=...&secret=...`; `host` is accepted as a
+legacy input alias, but generated links always use `server`.
+
+The Android client validates and canonicalizes both fields before treating the URL
+as a proxy link. Its confirmation sheet displays only the address and secret, with
+no independent status check, and starts the foreground WebView carrier only after
+the user chooses to connect. `tproxy-server` never handles the `t.me` URL itself,
+so this convention requires no relay endpoint or deployment change.
+
+The public `t.me` web frontend does not currently register `/webproxy`; if a
+browser handles the URL, it falls back to the `@webproxy` username. The POC link is
+therefore guaranteed only when TproxyWeb handles it internally or Android routes
+the HTTPS intent directly to TproxyWeb. Use the `tg://webproxy` form for direct
+cross-app testing and choose TproxyWeb when another Telegram client is installed.
+A production-wide HTTPS link requires Telegram to register the route on `t.me`.
 
 ## Build
 

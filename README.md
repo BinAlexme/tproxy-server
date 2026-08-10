@@ -214,6 +214,19 @@ Once the server is live, execute the complete matrix in
 `../tproxy/docs/web-proxy-test-plan.md` before depending on it where direct MTProto
 works unreliably.
 
+### Connect the Android proof-of-concept
+
+The accompanying TproxyWeb Android build can add the same relay with a link:
+
+```text
+https://t.me/webproxy?server=proxy.example.com&secret=000102030405060708090a0b0c0d0e0f
+```
+
+Replace both values with the deployed hostname and exact client-facing secret.
+The Android client uses a private foreground WebView and does not open or require a
+separate browser tab. See `ANDROID.md` for the link contract, client architecture,
+build steps, public `t.me` fallback limitation, and test matrix.
+
 ### Repeating this on several hosting accounts
 
 Give every server its own hostname, for example `north.example.com` and
