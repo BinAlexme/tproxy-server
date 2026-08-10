@@ -24,6 +24,11 @@ func TestRenderUsesNonceAndConfiguredBatch(t *testing.T) {
 	if !strings.Contains(body, "t:'traffic',up:total,down:0") || !strings.Contains(body, "t:'traffic',up:0,down:data.byteLength});\n   port.postMessage(data,[data])") {
 		t.Fatal("rendered bridge omitted acknowledged traffic counters")
 	}
+	if !strings.Contains(body, "t:'tproxy-android-init',v:1,nonce:androidNonce") ||
+		!strings.Contains(body, "globalThis.TelegramWebProxy") ||
+		!strings.Contains(body, "androidBridge.postMessage(value.slice(frame[0],frame[1]))") {
+		t.Fatal("rendered bridge omitted the origin-scoped Android transport")
+	}
 	for _, unwanted := range [][]byte{[]byte("pause(0)"), []byte(".slice(0)"), []byte("__BATCH_LIMIT__")} {
 		if bytes.Contains(page.Body, unwanted) {
 			t.Fatalf("rendered bridge retained %q", unwanted)

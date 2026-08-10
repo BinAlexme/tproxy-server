@@ -52,6 +52,7 @@ const document = `<!doctype html>
 (()=>{
 'use strict';
 const relayOrigin=__ORIGIN__,bootstrap=__BOOTSTRAP__;
+const fragment=location.hash,androidNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(fragment)?.[1]||'';
 history.replaceState(null,'',location.pathname);
 let initialized=false,closed=false,port=null,sessionToken='',upSequence=1,downCursor='0';
 let createStarted=false,upRunning=false,pollController=null,queuedBytes=0,queuedItems=0;
@@ -160,15 +161,9 @@ function close(notifyServer){
  }
  if(port)port.close();
 }
-addEventListener('message',event=>{
- if(initialized||event.source!==parent||event.data===null||typeof event.data!=='object')return;
- const keys=Object.keys(event.data).sort();
- if(keys.length!==2||keys[0]!=='t'||keys[1]!=='v'||event.data.t!=='tproxy-init'||event.data.v!==1||event.ports.length!==1)return;
- let source;
- try{source=new URL(event.origin)}catch(error){return}
- if(source.protocol!=='http:'||source.hostname!=='127.0.0.1'||!source.port||source.origin!==event.origin)return;
+function activatePort(nextPort){
  initialized=true;
- port=event.ports[0];
+ port=nextPort;
  port.onmessage=message=>{
   if(message.data instanceof ArrayBuffer){
    if(!createStarted){createStarted=true;createSession(message.data)}
@@ -181,7 +176,42 @@ addEventListener('message',event=>{
  };
  port.start();
  status('connecting');
+}
+addEventListener('message',event=>{
+ if(initialized||event.source!==parent||event.data===null||typeof event.data!=='object')return;
+ const keys=Object.keys(event.data).sort();
+ if(keys.length!==2||keys[0]!=='t'||keys[1]!=='v'||event.data.t!=='tproxy-init'||event.data.v!==1||event.ports.length!==1)return;
+ let source;
+ try{source=new URL(event.origin)}catch(error){return}
+ if(source.protocol!=='http:'||source.hostname!=='127.0.0.1'||!source.port||source.origin!==event.origin)return;
+ activatePort(event.ports[0]);
 },{once:false});
+const androidBridge=globalThis.TelegramWebProxy;
+if(!initialized&&androidNonce&&androidBridge&&typeof androidBridge.postMessage==='function'){
+ const androidPort={onmessage:null,start(){},close(){androidBridge.onmessage=null},postMessage(value){
+  if(value instanceof ArrayBuffer){
+   const view=new DataView(value),frames=[];let offset=0;
+   while(offset<value.byteLength){
+    if(value.byteLength-offset<8||frames.length>=4096){fail();return}
+    const size=view.getUint32(offset+4),end=offset+8+size;
+    if(!size&&view.getUint8(offset)===2||size>1048576||end>value.byteLength){fail();return}
+    frames.push([offset,end]);offset=end;
+   }
+   for(const frame of frames)androidBridge.postMessage(value.slice(frame[0],frame[1]));
+  }else{
+   androidBridge.postMessage(JSON.stringify(value));
+  }
+ }};
+ androidBridge.onmessage=event=>{
+  let data=event.data;
+  if(typeof data==='string'){
+   try{data=JSON.parse(data)}catch(error){return}
+  }
+  if(androidPort.onmessage)androidPort.onmessage({data});
+ };
+ activatePort(androidPort);
+ androidBridge.postMessage(JSON.stringify({t:'tproxy-android-init',v:1,nonce:androidNonce}));
+}
 addEventListener('pagehide',()=>close(true),{once:true});
 })();
 </script>

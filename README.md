@@ -5,6 +5,10 @@ use a real browser's ordinary HTTPS connection. The public hostname remains a re
 website. A value derived from the hostname and MTProxy secret selects a one-shot
 bridge page.
 
+The experimental Android hidden-WebView client design and build/test notes are in
+[`ANDROID.md`](ANDROID.md). It uses the same relay protocol and requires the small
+Android bridge-page extension included in this tree.
+
 The production layout is:
 
 ```text

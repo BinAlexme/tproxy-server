@@ -42,6 +42,43 @@ one port, and only when `event.origin` is an explicit
 `http://127.0.0.1:<port>` origin. Binary MessagePort messages are complete carrier
 batches. Control objects are status updates and `{t:'close'}`.
 
+## Android WebView boundary
+
+An Android client may load the same bridge document as the WebView main frame and
+append a client-only fragment:
+
+```text
+https://H/?bridge=bridge#android=android-nonce
+```
+
+`android-nonce` is 32 random bytes in canonical unpadded base64url form. It is not
+sent in the HTTPS request. Before navigation, the app injects a WebMessage listener
+named `TelegramWebProxy` for exactly the `https://H` origin. Both
+`WEB_MESSAGE_LISTENER` and `WEB_MESSAGE_ARRAY_BUFFER` must be supported by the
+installed Android System WebView. A wildcard origin or `addJavascriptInterface` is
+not part of this protocol.
+
+The bridge removes the query and fragment with `history.replaceState`, adapts the
+injected listener to its internal port contract, and sends this JSON string:
+
+```json
+{"t":"tproxy-android-init","v":1,"nonce":"android-nonce"}
+```
+
+The app accepts it only from the main frame, only from the exact configured HTTPS
+origin, and only when the nonce matches the value it generated. Messages from the
+bridge to the app are either JSON-encoded control strings or an ArrayBuffer
+containing exactly one complete shared frame. The bridge splits aggregated HTTP
+downlink batches at validated frame boundaries before crossing the WebView IPC
+boundary. Messages from the app to the bridge use the same two representations;
+the app should keep DATA frames at or below the relay's 64 KiB chunk size.
+
+The Android proof of concept points tgnet's existing MTProxy connection at a
+numeric loopback listener. Each accepted local TCP connection becomes one logical
+WEB stream, so bytes crossing this WebView boundary have already received the
+normal MTProxy transformation. The public relay remains unable to choose a client
+destination or decrypt the stream.
+
 ## HTTP carrier
 
 All API requests have `Origin: https://H`, no cookies, and a bearer token. Binary
