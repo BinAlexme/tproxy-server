@@ -127,6 +127,7 @@ async function runUp(){
    const response=await request('/api/v1/up',()=>options('POST',sessionToken,body,{'X-Up-Seq':sequence}));
    if(response.status!==204||response.headers.get('X-Up-Ack')!==sequence)throw new Error('uplink rejected');
    queuedBytes-=total;queuedItems-=count;
+   port.postMessage({t:'traffic',up:total,down:0});
    upSequence++;
   }
  }catch(error){fail()}
@@ -143,6 +144,7 @@ async function poll(){
    const data=await response.arrayBuffer();
    if(!next||!data.byteLength)throw new Error('invalid downlink response');
    if(closed)return;
+   port.postMessage({t:'traffic',up:0,down:data.byteLength});
    port.postMessage(data,[data]);
    downCursor=next;
    status('connected');

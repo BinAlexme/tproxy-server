@@ -25,6 +25,7 @@ if [[ ! -x "$source_directory/objs/bin/mtproto-proxy" ]] ||
 	[[ ! -f "$source_directory/.tproxy-commit" ]] ||
 	! grep -Fxq "$mtproxy_commit" "$source_directory/.tproxy-commit"; then
 	temporary="$(mktemp -d /tmp/mtproxy-build.XXXXXX)"
+	chmod 0711 "$temporary"
 	trap 'rm -rf "$temporary"' EXIT
 	archive="$temporary/MTProxy.tar.gz"
 	build_directory="$temporary/MTProxy"

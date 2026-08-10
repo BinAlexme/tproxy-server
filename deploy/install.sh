@@ -178,6 +178,20 @@ systemctl enable --now refresh-mtproxy-config.timer
 systemctl enable --now caddy.service
 systemctl restart caddy.service
 
+relay_ready=
+for ((attempt = 0; attempt != 20; ++attempt)); do
+	if curl --fail --silent --output /dev/null \
+			http://127.0.0.1:8081/readyz; then
+		relay_ready=1
+		break
+	fi
+	sleep 1
+done
+if [[ -z "$relay_ready" ]]; then
+	echo "tproxy-server did not become ready" >&2
+	exit 1
+fi
+
 echo
 echo "Installed for https://$hostname/"
 echo "Check: systemctl --no-pager --full status caddy mtproxy tproxy-server"

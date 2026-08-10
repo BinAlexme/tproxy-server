@@ -322,7 +322,10 @@ func loadProfiles(path, host string, limits Limits) ([]Profile, error) {
 	if err != nil {
 		return nil, fmt.Errorf("profiles_file: %w", err)
 	}
-	if info.Mode().Perm()&0077 != 0 {
+	extraPermissions := info.Mode().Perm() & 0077
+	credentialReadOnly := isSystemdCredential(path) &&
+		extraPermissions&0033 == 0
+	if extraPermissions != 0 && !credentialReadOnly {
 		return nil, errors.New("profiles_file must not be readable or writable by group or others")
 	}
 	input, err := os.ReadFile(path)
@@ -386,4 +389,16 @@ func loadProfiles(path, host string, limits Limits) ([]Profile, error) {
 		capabilities[capability] = struct{}{}
 	}
 	return result, nil
+}
+
+func isSystemdCredential(path string) bool {
+	directory := os.Getenv("CREDENTIALS_DIRECTORY")
+	if directory == "" || !filepath.IsAbs(directory) {
+		return false
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	return filepath.Dir(absolute) == filepath.Clean(directory)
 }

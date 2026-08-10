@@ -95,3 +95,36 @@ func TestLoadAppliesDefaultsAndRelativePaths(t *testing.T) {
 		t.Fatalf("unexpected loaded configuration: %#v", loaded)
 	}
 }
+
+func TestLoadAcceptsSystemdCredentialReadPermissions(t *testing.T) {
+	directory := t.TempDir()
+	public := filepath.Join(directory, "public")
+	if err := os.Mkdir(public, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(public, "index.html"), []byte("site"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	credentials := filepath.Join(directory, "credentials")
+	if err := os.Mkdir(credentials, 0700); err != nil {
+		t.Fatal(err)
+	}
+	profiles := filepath.Join(credentials, "profiles.json")
+	content := `{"profiles":[{"name":"default","secret":"000102030405060708090a0b0c0d0e0f","backend":"127.0.0.1:2398"}]}`
+	if err := os.WriteFile(profiles, []byte(content), 0444); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", credentials)
+	server := `{"public_hostname":"proxy.example.com","public_dir":"public","profiles_file":"credentials/profiles.json"}`
+	path := filepath.Join(directory, "config.json")
+	if err := os.WriteFile(path, []byte(server), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", "")
+	if _, err := Load(path); err == nil {
+		t.Fatal("group/other-readable profiles file outside a credential directory was accepted")
+	}
+}

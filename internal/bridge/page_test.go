@@ -21,6 +21,9 @@ func TestRenderUsesNonceAndConfiguredBatch(t *testing.T) {
 	if !strings.Contains(body, "queueItemLimit=16384") || !strings.Contains(body, "setTimeout(abort,90000)") {
 		t.Fatal("rendered bridge omitted its item or request bound")
 	}
+	if !strings.Contains(body, "t:'traffic',up:total,down:0") || !strings.Contains(body, "t:'traffic',up:0,down:data.byteLength});\n   port.postMessage(data,[data])") {
+		t.Fatal("rendered bridge omitted acknowledged traffic counters")
+	}
 	for _, unwanted := range [][]byte{[]byte("pause(0)"), []byte(".slice(0)"), []byte("__BATCH_LIMIT__")} {
 		if bytes.Contains(page.Body, unwanted) {
 			t.Fatalf("rendered bridge retained %q", unwanted)
