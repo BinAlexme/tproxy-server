@@ -150,8 +150,10 @@ malformed frame, a queue overflow, and app background/foreground transitions.
   may throttle or kill it in the background; this is accepted behavior. No
   foreground service, background keepalive, or renderer-retention workaround is
   required for this feature.
-- There is no independent WEB proxy ping. Non-active WEB rows are marked available
-  syntactically; the real connection state is learned only after activation.
+- There is no independent WEB proxy ping. Non-active WEB rows display `Not tested`;
+  the real connection state is learned only after activation. Automatic or
+  sequential list-page tests would churn the process-wide WebView carrier and are
+  intentionally unsupported.
 - WEB entries are excluded from proxy rotation and calls. One process-wide WebView
   carrier serves all Telegram accounts.
 - The historical capability context remains
