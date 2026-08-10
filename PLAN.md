@@ -694,6 +694,7 @@ tproxy-server/
 │   ├── Caddyfile
 │   ├── caddy.service
 │   ├── install.sh
+│   ├── update-relay.sh
 │   ├── tproxy-server.service
 │   ├── mtproxy.service
 │   ├── tproxy-firewall.service

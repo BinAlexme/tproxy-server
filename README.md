@@ -309,11 +309,23 @@ routing data is active. Existing backend streams reconnect through the still-liv
 relay session. The public website remains available when either backend process is
 down; `/readyz` reports the backend outage.
 
-For an update, upload the new repository, run `go test ./...`, build a temporary
-binary, install it atomically, and restart only `tproxy-server`. Keep the previous
-binary and `/etc/tproxy-server` as rollback material. Running the automated installer
-again preserves an existing site directory but replaces the single-profile config
-and active Caddyfile, so use it deliberately.
+For a relay-code update, upload the new repository and run from its root:
+
+```bash
+sudo ./deploy/update-relay.sh
+```
+
+The updater finds the installed Go toolchain, runs all Go tests, builds and validates
+a candidate against the installed configuration, keeps the previous binary, installs
+the candidate atomically, and restarts only `tproxy-server`. It waits for health and,
+when the old deployment was ready, backend readiness; a failure automatically rolls
+back to the previous binary. Existing browser sessions are invalidated and users must
+choose **Open browser** again.
+
+This script intentionally does not replace configuration, systemd units, Caddy,
+MTProxy, firewall rules, or public-site files. Running the complete automated
+installer again preserves an existing site directory but replaces the single-profile
+config and active Caddyfile, so use it deliberately.
 
 ## Troubleshooting
 
