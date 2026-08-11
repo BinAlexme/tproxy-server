@@ -1,0 +1,206 @@
+# iOS WEB proxy proof of concept
+
+This document maps the WEB proxy carrier implemented in the official Telegram iOS
+fork at `../Other/Telegram-iOS`. The proof of concept reuses iOS MtProtoKit's
+existing MTProxy transform and the bridge page already used by the Android fork.
+The public relay protocol remains compatible with Telegram Desktop and Android.
+
+## Chosen architecture
+
+```text
+Telegram iOS MtProtoKit
+  existing MTProxy encryption and framing
+        |
+        | TCP to 127.0.0.1:<ephemeral>
+        v
+WebProxyTransport Swift sidecar
+  one logical WEB stream per accepted NWConnection
+        |
+        | authenticated WKWebView message shim
+        v
+private WKWebView main frame
+  https://proxy.example/?bridge=...#android=<nonce>
+        |
+        | same-origin HTTPS fetch long-poll
+        v
+tproxy-server -> stock MTProxy -> Telegram DC
+```
+
+`MTTcpConnection` already applies the MTProxy obfuscated2 transform whenever
+`MTSocksProxySettings.secret` is present. The WEB adapter can therefore replace
+only the configured socket address with a numeric loopback listener and preserve
+the secret. The Swift and WebKit layers carry opaque, already transformed bytes;
+the server still cannot select a destination or decrypt the stream. No MtProtoKit
+transport rewrite is required for the first experiment.
+
+Use Network.framework for a loopback-only `NWListener` and its accepted
+`NWConnection` values. The sidecar implements the shared `HELLO`, `WELCOME`,
+`OPEN`, `DATA`, `CLOSE`, `WINDOW`, `PING`, and `PONG` frames, including the
+protocol limits and per-stream flow control in `PROTOCOL.md`.
+
+## Reusing the current server bridge
+
+No server code, Caddy configuration, relay endpoint, or deployment change is
+required for the iOS proof of concept. The iOS client can intentionally emulate
+the existing Android WebView boundary:
+
+1. derive the same bridge capability and load the existing
+   `#android=<43-character nonce>` URL;
+2. inject a page-world object named `globalThis.TelegramWebProxy` before the main
+   document starts;
+3. translate the injected object's `postMessage` calls to a randomly named native
+   `WKScriptMessageHandler`; and
+4. translate native messages back to the object callback expected by the bridge.
+
+The words `android` and `tproxy-android-init` are legacy wire names in this path,
+not a platform assertion. Reusing them keeps every deployed server compatible. A
+future protocol revision can introduce platform-neutral names, but that would be a
+versioned cleanup rather than a prerequisite for iOS.
+
+WebKit's script-message boundary is not the public relay protocol. The injected
+shim may base64-encode a complete binary frame inside its private JSON envelope;
+the remote bridge still observes the same ArrayBuffer-or-control-string contract,
+and the HTTP carrier and frame bytes do not change.
+
+## WKWebView boundary
+
+Create the view with a nonpersistent `WKWebsiteDataStore` and a
+`WKUserContentController`. Install a page-world `WKUserScript` at document start,
+restricted to the main frame. The script defines a nonreplaceable
+`TelegramWebProxy` object and uses a cryptographically random handler name and
+nonce for each carrier instance.
+
+The native handler must accept a message only when all of these still match the
+active configuration:
+
+- the sending `WKWebView` instance;
+- the random handler name and nonce;
+- the main frame;
+- the exact `https://H` security origin; and
+- the current main-frame navigation URL.
+
+Allow only the canonical configured hostname on HTTPS port 443. Reject IP
+literals, user info, redirects, TLS exceptions, subframes, wildcard origins, and
+navigation away from the bridge. Remove the handler when replacing the carrier so
+an old document cannot reach a new session.
+
+Derive the capability with CryptoKit HMAC-SHA256 from the complete decoded secret,
+retaining the leading `dd` byte. The historical context remains
+`tdesktop-web-proxy-bridge-v1\nH`. Never log the capability, nonce, session token,
+or bridge URL.
+
+The bridge currently emits one validated shared frame per WebView binary message.
+Ordinary DATA is at most 64 KiB and the protocol payload maximum is 1 MiB. Base64
+copying is acceptable for a proof of concept, but memory and latency must be
+measured before treating it as a production transport.
+
+## iOS source changes
+
+The implementation is isolated in a new Swift `WebProxyTransport` module
+with `WebKit`, `Network`, and `CryptoKit` SDK dependencies. TelegramCore can depend
+on that module without teaching MtProtoKit about WebKit.
+
+- `submodules/TelegramCore/Sources/SyncCore/SyncCore_ProxySettings.swift` adds an
+  explicit `.web(secret:)` connection encoded with a new `_t` value. Existing
+  SOCKS5 and MTProxy records remain byte-for-byte compatible.
+- `submodules/TelegramCore/Sources/Settings/ProxySettings.swift` resolves an active
+  WEB relay to the sidecar's numeric loopback address, ephemeral listener port,
+  and original secret. The saved public WEB endpoint remains fixed to HTTPS port
+  443. Resolution must fail closed; never fall back to the public hostname as a
+  direct MTProxy socket.
+- Initial setup in `Network.swift` and shared live updates for authorized and
+  unauthorized accounts in `Account.swift` use one idempotent process-wide
+  carrier. WEB can therefore bootstrap the login network before authorization.
+  Disabling or replacing WEB closes its listener, WebView, HTTP session, and all
+  logical streams.
+- `ProxyServerSettingsController.swift` adds a WEB mode, fixes its public port to
+  443, and validates a canonical DNS hostname plus a supported MTProxy secret.
+- `ProxyListSettingsController.swift`, `DataAndStorageSettingsController.swift`,
+  Settings search, peer-info settings, and QR/preview switches learn the explicit
+  type.
+- `ProxyServersStatuses.swift` does not ping inactive WEB rows. They display
+  `Not tested`; only the active row follows the real account connection state.
+- Calls remain SOCKS5-only. A WEB entry must not be offered for calls.
+- `ProxyServerPreviewScreen.swift` must not compare a WEB connection's reported
+  loopback address with its saved public hostname. Its WEB preview omits the
+  implicit HTTPS port and inactive status check; Connect waits for the account
+  network to report online through the loopback adapter.
+
+The fork implements `tg://webproxy` handling across `UrlHandling`,
+`OpenResolvedUrl`, sharing, clipboard parsing, and QR code generation. Its isolated
+local app registers `tproxyweb` instead of competing with the installed Telegram
+app for `tg`; direct device tests replace only the scheme. The public `t.me`
+frontend does not currently register a WEB proxy route.
+
+Official Telegram iOS exposes proxy settings before login only from its
+network-timeout alert; it has no persistent authorization-screen proxy indicator.
+A production WEB UI should match Android's pre-login proxy icon and connection
+state.
+
+TelegramCore is also linked into app extensions. The transport rejects startup
+when the main bundle path ends in `.appex`, and the isolated POC build disables
+extensions entirely.
+
+## Lifecycle limitation
+
+This is a foreground-only POC. iOS normally suspends an app shortly after it enters
+the background, and a background task grants only limited completion time. The
+carrier must close or become unavailable on background and recreate after the app
+returns to the foreground. It must not claim continuous background delivery.
+
+The implementation attaches a strongly retained, transparent, noninteractive
+one-pixel `WKWebView` to the app window while WEB is active. Do not use background
+audio, location, VoIP, or another unrelated background mode to keep it alive.
+
+One process-wide carrier should serve all accounts. Account-specific observers may
+request the same configuration, but carrier start/stop and listener allocation
+must remain idempotent. A conflicting WEB configuration should replace the old one
+and force all account networks to reconnect.
+
+## Identity and diagnostics
+
+MtProtoKit currently reports `MTSocksProxySettings.ip` as the active proxy address.
+For the POC that value is `127.0.0.1`, while the saved relay is the public hostname.
+The preview/status UI must account for this or it can wait forever for an address
+match. Do not display or share the loopback endpoint.
+
+Before production, add an explicit proxy kind plus separate connect and display
+addresses below TelegramCore. This also prevents the loopback address from being
+used for proxy-sponsored-channel identity or diagnostics. Logs may expose coarse
+states, stream counts, and aggregate byte counts, never endpoints, capabilities,
+secrets, bearer tokens, bridge URLs, or message content.
+
+## Build and device test
+
+Follow the local checkout's `TPROXYWEB.md` for the prepared machine state, signing
+inputs, exact project-generation command, and device checklist. The first build
+should use Xcode-managed signing and disabled extensions so notification, widget,
+share, broadcast, and intent profiles are not prerequisites for the transport
+experiment.
+
+Test at minimum:
+
+1. existing SOCKS5 and MTProxy records still decode, edit, share, and connect;
+2. plain 16-byte and `dd` secrets both connect through WEB;
+3. messages and large upload/download traffic respect flow control;
+4. disable, edit, relaunch, foreground/background, Wi-Fi/cellular changes, and a
+   terminated WebKit content process reconnect cleanly;
+5. wrong secret, bad certificate, redirect, invalid hostname, malformed frame,
+   queue overflow, and server loss fail closed; and
+6. the public TLS connection originates in WebKit while the stock MTProxy backend
+   still receives valid transformed traffic.
+
+Useful Apple references are
+[WKScriptMessageHandler](https://developer.apple.com/documentation/webkit/wkscriptmessagehandler),
+[WKUserScript main-frame restriction](https://developer.apple.com/documentation/webkit/wkuserscript/1537856-formainframeonly),
+[Network.framework local endpoints](https://developer.apple.com/documentation/network/nwparameters/requiredlocalendpoint),
+and [background execution limits](https://developer.apple.com/documentation/uikit/extending-your-app-s-background-execution-time).
+
+## Production follow-up
+
+Deterministic tests cover capability derivation, hostname/secret validation, frame
+parsing, malformed input, and persistence compatibility. A production pass should
+add a local WebKit bridge fixture, state-machine and queue-bound fault injection,
+and WebKit process termination coverage. It should also measure memory, CPU,
+base64-copy overhead, reconnect latency, foreground endurance, and multi-account
+behavior on multiple iOS releases before considering a broader rollout.

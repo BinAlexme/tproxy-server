@@ -9,6 +9,10 @@ The experimental Android hidden-WebView client design and build/test notes are i
 [`ANDROID.md`](ANDROID.md). It uses the same relay protocol and requires the small
 Android bridge-page extension included in this tree.
 
+The corresponding iOS hidden-`WKWebView` proof-of-concept plan is in
+[`IOS.md`](IOS.md). It reuses the Android bridge-page extension without another
+relay, Caddy, or deployment change.
+
 The production layout is:
 
 ```text

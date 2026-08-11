@@ -40,7 +40,10 @@ iframe.contentWindow.postMessage(
 The bridge accepts this once, only from its parent, only with the exact object and
 one port, and only when `event.origin` is an explicit
 `http://127.0.0.1:<port>` origin. Binary MessagePort messages are complete carrier
-batches. Control objects are status updates and `{t:'close'}`.
+batches. Control objects are `{t:'status',state}`, diagnostic
+`{t:'traffic',up,down}` byte counts, and `{t:'close'}`. Traffic counts are
+nonnegative numbers describing the completed carrier operation; clients may
+discard them after validation.
 
 ## Android WebView boundary
 
@@ -78,6 +81,22 @@ numeric loopback listener. Each accepted local TCP connection becomes one logica
 WEB stream, so bytes crossing this WebView boundary have already received the
 normal MTProxy transformation. The public relay remains unable to choose a client
 destination or decrypt the stream.
+
+### iOS compatibility
+
+An iOS proof of concept may reuse this boundary without a server protocol change.
+It loads the same `#android` fragment, exposes the same `TelegramWebProxy` page
+object, and accepts the same `tproxy-android-init` control string. Those names are
+retained as legacy v1 wire identifiers; they do not require an Android runtime.
+
+Because `WKScriptMessageHandler` does not expose Android's ArrayBuffer message API,
+an iOS-injected page shim may base64-encode one complete shared frame while crossing
+only the private JavaScript-to-native IPC boundary. The shim decodes it before
+presenting an ArrayBuffer to the bridge, and performs the inverse conversion for
+native-to-bridge traffic. This encoding is not part of the HTTP carrier or shared
+frame format. The native handler must still authenticate the main frame, exact
+HTTPS origin, active WebView, random nonce, and current navigation before accepting
+any message.
 
 ## HTTP carrier
 
