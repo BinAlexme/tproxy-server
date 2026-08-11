@@ -166,9 +166,9 @@ match. Do not display or share the loopback endpoint.
 
 Before production, add an explicit proxy kind plus separate connect and display
 addresses below TelegramCore. This also prevents the loopback address from being
-used for proxy-sponsored-channel identity or diagnostics. Logs may expose coarse
-states, stream counts, and aggregate byte counts, never endpoints, capabilities,
-secrets, bearer tokens, bridge URLs, or message content.
+used for proxy-sponsored-channel identity or diagnostics. New carrier diagnostics
+may expose coarse states, stream counts, and aggregate byte counts, never
+endpoints, capabilities, secrets, bearer tokens, bridge URLs, or message content.
 
 ## Build and device test
 
