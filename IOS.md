@@ -3,7 +3,8 @@
 This document maps the WEB proxy carrier implemented in the official Telegram iOS
 fork at `../Other/Telegram-iOS`. The proof of concept reuses iOS MtProtoKit's
 existing MTProxy transform and the bridge page already used by the Android fork.
-The public relay protocol remains compatible with Telegram Desktop and Android.
+It implements the same client-neutral relay protocol as the Desktop and Android
+proofs of concept.
 
 ## Chosen architecture
 

@@ -1,19 +1,58 @@
 # tproxy-server
 
-`tproxy-server` lets the WEB proxy type in the accompanying Telegram Desktop build
-use a real browser's ordinary HTTPS connection. The public hostname remains a real
-website. A value derived from the hostname and MTProxy secret selects a one-shot
-bridge page.
+`tproxy-server` is the hosted half of a proof-of-concept WEB proxy type for
+Telegram. A Telegram app keeps its normal MTProxy framing and encryption, but sends
+all of its proxy TCP connections through one app-owned WebView transport. The
+WebView carries a multiplexed session over ordinary same-origin HTTPS requests.
+The relay separates the logical streams again and connects each one to a stock
+official MTProxy on the server.
 
-The experimental Android hidden-WebView client design and build/test notes are in
-[`ANDROID.md`](ANDROID.md). It uses the same relay protocol and requires the small
-Android bridge-page extension included in this tree.
+The design is not tied to one Telegram client or operating system. Any Telegram
+app that can host a WebView and connect its MTProxy sockets to a small local adapter
+can implement the client side. The current proof-of-concept work includes a
+Telegram Desktop implementation, an experimental Android client described in
+[`ANDROID.md`](ANDROID.md), and an iOS client plan in [`IOS.md`](IOS.md). All use
+the same bridge page, HTTP carrier, shared frame format, and server deployment.
 
-The corresponding iOS hidden-`WKWebView` proof-of-concept plan is in
-[`IOS.md`](IOS.md). It reuses the Android bridge-page extension without another
-relay, Caddy, or deployment change.
+The configured hostname remains a regular HTTPS website. A capability derived from
+the hostname and MTProxy secret selects a one-shot bridge page; every other normal
+request receives the public site.
 
-The production layout is:
+## How it works
+
+```text
+Telegram app
+  MTProto connections with the normal MTProxy transform
+          |
+          v
+  local WEB proxy adapter
+  one logical stream per app connection
+          |
+          v
+  one WebView transport and authenticated relay session
+  multiplexed frames in HTTPS POST requests
+          |
+          v
+  tproxy-server -> one local TCP connection per stream -> official MTProxy
+```
+
+The app configures only a hostname and an MTProxy secret. It derives the bridge
+capability locally and never exposes the raw secret to JavaScript. The WebView
+opens the bridge, exchanges a short-lived bootstrap token for a relay session, and
+runs one serialized uplink request queue beside one downlink long poll. `OPEN`,
+`DATA`, `WINDOW`, and `CLOSE` frames multiplex every app connection through that
+session. The relay treats DATA as opaque bytes: it cannot choose a Telegram
+destination or decrypt the MTProxy stream.
+
+“One WebView transport” means one logical carrier and relay session for the app,
+not one HTTP request. The bridge normally has an uplink POST and a downlink
+long-poll active concurrently and starts new requests as those operations complete.
+
+See [`PROTOCOL.md`](PROTOCOL.md) for the normative wire contract and
+[`PLAN.md`](PLAN.md) for the architecture, limits, implementation rationale, and
+remaining proof-of-concept work.
+
+The reference deployment layout is:
 
 ```text
 Internet :80/:443 -> Caddy -> static website
@@ -62,10 +101,8 @@ Generate the client-facing secret on your own computer:
 openssl rand -hex 16
 ```
 
-That produces 32 lowercase hexadecimal characters. To enable MTProxy random-padding
-mode, prefix those characters with `dd`. Keep the exact resulting 32- or
-34-character value: it is entered in Telegram Desktop and passed to the installer.
-The installer removes `dd` only for the stock MTProxy backend.
+That produces 32 lowercase hexadecimal characters. Keep the exact value: it is
+entered in every client that uses this server and passed to the installer.
 
 ## 2. Prepare the real public site
 
@@ -86,7 +123,7 @@ In the hosting provider's network rules or firewall, allow:
 |---:|---|---|
 | TCP 22 | your administrator IP if possible | SSH |
 | TCP 80 | anywhere | ACME validation and HTTPS redirect |
-| TCP 443 | anywhere | website and browser transport |
+| TCP 443 | anywhere | website and WebView transport |
 
 Do not allow TCP 2398, 8080, 8081, or 8888. The installer adds a local nftables rule
 that drops external traffic to 2398 and 8888, but the provider firewall is the
@@ -121,8 +158,14 @@ sudo ./deploy/install.sh \
   --email you@example.com
 ```
 
-The installer prompts without echo for the secret. Paste the exact 32- or
-34-character value there. This keeps it out of the shell history and process list.
+The backend defaults to one official MTProxy worker and 4096 accepted client
+connections per worker. On a measured multi-core deployment, the installer also
+accepts `--mtproxy-workers N` and `--mtproxy-max-connections N`. Keep one worker for
+the first deployment; raise it only while watching both MTProxy stats and relay CPU,
+because Caddy and the Go relay need CPU on the same host.
+
+The installer prompts without echo for the secret. Paste the exact value there.
+This keeps it out of the shell history and process list.
 For unattended provisioning, `--secret` is available, but it places the value in
 the invoking process list and should be used only in automation where process
 arguments are controlled.
@@ -192,44 +235,45 @@ curl --fail 'https://proxy.example.com/?bridge=wrong'
 curl --fail 'https://proxy.example.com/?bridge=wrong&x=1'
 ```
 
-Do not paste the real derived bridge URL into logs or test commands. Telegram
-Desktop derives it in memory.
+Do not paste the real derived bridge URL into logs or test commands. A conforming
+client derives it in memory.
 
-## 6. Connect Telegram Desktop
+## 6. Configure a Telegram client
 
-In the accompanying tdesktop build:
+A WEB-capable Telegram app accepts exactly two user-visible values:
 
-1. open **Settings → Advanced → Connection type → Use custom proxy**;
-2. add a **WEB** proxy;
-3. enter only `proxy.example.com` as the hostname;
-4. enter the exact client-facing secret, including `dd` when you selected it;
-5. enable the proxy; and
-6. choose **Open browser** and keep that tab open.
+```text
+Hostname: proxy.example.com
+Secret:   000102030405060708090a0b0c0d0e0f
+```
 
-The address field must not contain `https://`, `:443`, a slash, or a query. Telegram
-Desktop opens a loopback page; that page embeds the HTTPS bridge. The
-external DNS and TLS connection belongs to the real browser.
+The hostname field contains no `https://`, port, slash, query, or fragment. HTTPS
+and port 443 are fixed by the WEB proxy type. Internationalized domains are stored
+as lowercase ASCII IDNA A-labels. The secret is the same client-facing MTProxy
+secret configured in the corresponding server profile.
 
-For an internationalized domain, convert the name to its lowercase ASCII IDNA
-A-label form before putting it in the server configuration; tdesktop stores the
-same canonical form internally.
-
-Once the server is live, execute the complete matrix in
-`../tproxy/docs/web-proxy-test-plan.md` before depending on it where direct MTProto
-works unreliably.
-
-### Connect the Android proof-of-concept
-
-The accompanying TproxyWeb Android build can add the same relay with a link:
+A shareable WEB proxy link is:
 
 ```text
 https://t.me/webproxy?server=proxy.example.com&secret=000102030405060708090a0b0c0d0e0f
 ```
 
-Replace both values with the deployed hostname and exact client-facing secret.
-The Android client uses a private foreground WebView and does not open or require a
-separate browser tab. See `ANDROID.md` for the link contract, client architecture,
-build steps, public `t.me` fallback limitation, and test matrix.
+Clients may also accept the equivalent `tg://webproxy` form. The public `t.me`
+frontend does not yet register this route, so proof-of-concept testing may require
+opening the link directly in the intended client.
+
+Current client status:
+
+- Telegram Desktop has a process-wide hidden native WebView carrier and an explicit
+  system-browser fallback. Its full hosted test matrix is in
+  `../tproxy/docs/web-proxy-test-plan.md`.
+- The Android proof of concept uses a private, foreground-scoped Android System
+  WebView. See [`ANDROID.md`](ANDROID.md) for its build and test instructions.
+- The planned iOS proof of concept uses a process-wide `WKWebView` carrier. See
+  [`IOS.md`](IOS.md) for its design and lifecycle plan.
+
+These are client implementations of the same WEB proxy protocol, not separate
+server modes.
 
 ### Repeating this on several hosting accounts
 
@@ -285,8 +329,27 @@ client secret, and numeric loopback backend:
 ```json
 {
   "profiles": [
-    {"name":"alpha","secret":"0123456789abcdef0123456789abcdef","backend":"127.0.0.1:2398"},
-    {"name":"beta","secret":"ddfedcba9876543210fedcba9876543210","backend":"127.0.0.1:2399","limits":{"max_streams_per_session":32,"max_pending_per_session":8388608}}
+    {
+      "name": "alpha",
+      "secret": "0123456789abcdef0123456789abcdef",
+      "backend": "127.0.0.1:2398"
+    },
+    {
+      "name": "beta",
+      "secret": "fedcba9876543210fedcba9876543210",
+      "backend": "127.0.0.1:2399",
+      "limits": {
+        "max_sessions": 32,
+        "max_streams": 512,
+        "max_backend_dials_in_flight": 64,
+        "new_sessions_per_minute": 120,
+        "new_sessions_burst": 32,
+        "new_streams_per_minute": 1200,
+        "new_streams_burst": 128,
+        "max_streams_per_session": 32,
+        "max_pending_per_session": 8388608
+      }
+    }
   ]
 }
 ```
@@ -296,14 +359,52 @@ separate quotas or routing. Extend `firewall.nft` to include every added backend
 port. A single MTProxy may receive repeated `-S` arguments only when all profiles
 intentionally share the same policy and routing scope.
 
-Restarting `tproxy-server` invalidates active browser sessions:
+### Capacity limits
+
+The process-wide limits in `config.json` are the mandatory safety boundary. The
+important admission controls are:
+
+| Field | Default | Meaning |
+|---|---:|---|
+| `max_sessions_global` | 128 | live WebView carrier sessions |
+| `max_streams_global` | 4096 | live backend TCP streams |
+| `max_backend_dials_in_flight` | 256 | simultaneous backend connection attempts |
+| `new_sessions_per_minute` / `new_sessions_burst` | 600 / 128 | process-wide session creation bucket |
+| `new_streams_per_minute` / `new_streams_burst` | 6000 / 512 | process-wide stream creation bucket |
+| `max_bootstraps_global` | 512 | live one-shot bridge bootstrap entries |
+| `new_bootstraps_per_minute` / `new_bootstraps_burst` | 1200 / 256 | process-wide bootstrap creation bucket |
+| `max_pending_global` / `max_pending_items_global` | 512 MiB / 262144 | process-wide buffered relay data and allocations |
+
+`max_sessions_per_ip` and `max_bootstraps_per_ip` default to `0`, which disables
+those optional hard limits. This is deliberate: many legitimate users may share a
+carrier-grade NAT address. Set a positive value only when the deployment needs a
+secondary source-address abuse boundary; it does not replace the global limits.
+
+Every `limits` value in a profile is optional. An omitted value inherits the
+corresponding global value, so the default single profile adds no second quota.
+Profile values may only lower the global ceiling. With several secrets, the global
+buckets protect the whole process and each profile's session and stream buckets
+prevent one secret from consuming more than its configured share. A stream rejected
+by a capacity or creation-rate limit receives `CLOSE`; other streams and the parent
+session remain active. Authenticated session creation overload returns HTTP 503 with
+`Retry-After` so the bridge can retry safely.
+
+Official MTProxy has a separate process-level boundary. Its systemd service reads
+`MTPROXY_WORKERS` and `MTPROXY_MAX_CONNECTIONS` from
+`/etc/mtproxy/mtproxy.env`, defaulting to `1` and `4096`. The connection value is
+passed to official MTProxy's per-worker `-C` limit. Keep the relay's
+`max_streams_global` at or below the intended aggregate backend capacity and increase
+workers only after one worker is CPU-bound; extra MTProxy workers do not accelerate
+Caddy, the WebView bridge, or the Go relay.
+
+Restarting `tproxy-server` invalidates active carrier sessions:
 
 ```bash
 sudo systemctl restart tproxy-server
 ```
 
-Users then choose **Open browser** again. Existing TCP streams are intentionally not
-resumed across a relay restart.
+Existing TCP streams are intentionally not resumed across a relay restart. The
+client recreates its WebView carrier and logical streams.
 
 ## Operations and updates
 
@@ -340,13 +441,29 @@ The updater finds the installed Go toolchain, runs all Go tests, builds and vali
 a candidate against the installed configuration, keeps the previous binary, installs
 the candidate atomically, and restarts only `tproxy-server`. It waits for health and,
 when the old deployment was ready, backend readiness; a failure automatically rolls
-back to the previous binary. Existing browser sessions are invalidated and users must
-choose **Open browser** again.
+back to the previous binary. Existing carrier sessions are invalidated; clients
+must obtain a fresh bridge page and relay session automatically.
 
 This script intentionally does not replace configuration, systemd units, Caddy,
 MTProxy, firewall rules, or public-site files. Running the complete automated
 installer again preserves an existing site directory but replaces the single-profile
 config and active Caddyfile, so use it deliberately.
+
+When an update includes reviewed changes to the supplied relay or MTProxy unit,
+install those units separately and then restart the affected services:
+
+```bash
+sudo install -m 0644 deploy/tproxy-server.service \
+  /etc/systemd/system/tproxy-server.service
+sudo install -m 0644 deploy/mtproxy.service \
+  /etc/systemd/system/mtproxy.service
+sudo systemctl daemon-reload
+sudo systemctl restart mtproxy tproxy-server
+```
+
+The new unit defaults remain compatible with an existing `mtproxy.env` containing
+only `MTPROXY_SECRET`; add `MTPROXY_WORKERS` and `MTPROXY_MAX_CONNECTIONS` there only
+when overriding the defaults.
 
 ## Troubleshooting
 
@@ -355,13 +472,14 @@ config and active Caddyfile, so use it deliberately.
   record rather than leaving IPv6 half-configured.
 - **`/readyz` returns 503:** inspect `systemctl status mtproxy`, then confirm a local
   TCP connection to `127.0.0.1:2398` and the downloaded files under `/etc/mtproxy`.
-- **The browser shows the public site instead of connecting:** hostname and secret
-  must match the server profile exactly; `dd` changes the bridge capability.
-- **Telegram Desktop remains “Waiting for browser”:** use **Open browser** from the
-  same running desktop instance and ensure local firewall or network software
-  permits its loopback WebSocket.
+- **The WebView shows the public site instead of connecting:** hostname and secret
+  must match the server profile exactly; the client derives a different capability
+  for every hostname/secret pair.
+- **The client remains in its connecting state:** confirm the WebView can load the
+  exact HTTPS hostname, then use the platform-specific client document for native
+  bridge, lifecycle, and fallback diagnostics.
 - **The public site works but the bridge fails:** inspect only sanitized service
-  status and metrics. Never log the browser address bar or authorization headers.
+  status and metrics. Never log bridge URLs or authorization headers.
 - **Configuration check fails on permissions:** the profiles file must have no group
   or other permission bits. Use `chmod 0400` and ensure the service receives it via
   `LoadCredential`.

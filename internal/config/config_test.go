@@ -94,6 +94,40 @@ func TestLoadAppliesDefaultsAndRelativePaths(t *testing.T) {
 	if loaded.PublicDir != public || len(loaded.Profiles) != 1 || loaded.Limits.MaxBodyBytes != 2*1024*1024 {
 		t.Fatalf("unexpected loaded configuration: %#v", loaded)
 	}
+	profileLimits := loaded.Profiles[0].Limits
+	if profileLimits.MaxSessions != loaded.Limits.MaxSessionsGlobal ||
+		profileLimits.MaxStreams != loaded.Limits.MaxStreamsGlobal ||
+		profileLimits.MaxBackendDialsInFlight != loaded.Limits.MaxBackendDialsInFlight ||
+		profileLimits.NewSessionsPerMinute != loaded.Limits.NewSessionsPerMinute ||
+		profileLimits.NewStreamsPerMinute != loaded.Limits.NewStreamsPerMinute {
+		t.Fatalf("profile limits did not inherit global values: %#v", profileLimits)
+	}
+}
+
+func TestProfileStreamDefaultsRespectProfileCeiling(t *testing.T) {
+	global := Defaults().Limits
+	resolved := (ProfileLimits{MaxStreams: 32}).WithDefaults(global)
+	if resolved.MaxStreamsPerSession != 32 ||
+		resolved.MaxBackendDialsInFlight != 32 ||
+		resolved.MaxSessions != global.MaxSessionsGlobal ||
+		resolved.NewStreamsPerMinute != global.NewStreamsPerMinute {
+		t.Fatalf("unexpected resolved profile limits: %#v", resolved)
+	}
+}
+
+func TestProfileLimitsCannotExceedGlobalCeilings(t *testing.T) {
+	global := Defaults().Limits
+	if err := validateProfileLimits(ProfileLimits{
+		MaxStreams: global.MaxStreamsGlobal + 1,
+	}, global); err == nil {
+		t.Fatal("profile max_streams exceeded the global ceiling")
+	}
+	if err := validateProfileLimits(ProfileLimits{
+		MaxStreams:           16,
+		MaxStreamsPerSession: 17,
+	}, global); err == nil {
+		t.Fatal("per-session stream limit exceeded the profile stream ceiling")
+	}
 }
 
 func TestLoadAcceptsSystemdCredentialReadPermissions(t *testing.T) {

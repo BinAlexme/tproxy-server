@@ -52,8 +52,12 @@ type Limits struct {
 	MaxPendingItemsGlobal     int `json:"max_pending_items_global"`
 	MaxSessionsPerIP          int `json:"max_sessions_per_ip"`
 	MaxSessionsGlobal         int `json:"max_sessions_global"`
+	MaxStreamsGlobal          int `json:"max_streams_global"`
+	MaxBackendDialsInFlight   int `json:"max_backend_dials_in_flight"`
 	NewSessionsPerMinute      int `json:"new_sessions_per_minute"`
 	NewSessionsBurst          int `json:"new_sessions_burst"`
+	NewStreamsPerMinute       int `json:"new_streams_per_minute"`
+	NewStreamsBurst           int `json:"new_streams_burst"`
 	MaxBootstrapsPerIP        int `json:"max_bootstraps_per_ip"`
 	MaxBootstrapsGlobal       int `json:"max_bootstraps_global"`
 	NewBootstrapsPerMinute    int `json:"new_bootstraps_per_minute"`
@@ -95,8 +99,15 @@ type profileInput struct {
 }
 
 type ProfileLimits struct {
-	MaxStreamsPerSession int `json:"max_streams_per_session"`
-	MaxPendingPerSession int `json:"max_pending_per_session"`
+	MaxSessions             int `json:"max_sessions"`
+	MaxStreams              int `json:"max_streams"`
+	MaxBackendDialsInFlight int `json:"max_backend_dials_in_flight"`
+	NewSessionsPerMinute    int `json:"new_sessions_per_minute"`
+	NewSessionsBurst        int `json:"new_sessions_burst"`
+	NewStreamsPerMinute     int `json:"new_streams_per_minute"`
+	NewStreamsBurst         int `json:"new_streams_burst"`
+	MaxStreamsPerSession    int `json:"max_streams_per_session"`
+	MaxPendingPerSession    int `json:"max_pending_per_session"`
 }
 
 type Profile struct {
@@ -104,6 +115,42 @@ type Profile struct {
 	Backend    string
 	Capability [sha256.Size]byte
 	Limits     ProfileLimits
+}
+
+func (limits ProfileLimits) WithDefaults(global Limits) ProfileLimits {
+	result := limits
+	if result.MaxSessions == 0 {
+		result.MaxSessions = global.MaxSessionsGlobal
+	}
+	if result.MaxStreams == 0 {
+		result.MaxStreams = global.MaxStreamsGlobal
+	}
+	if result.MaxBackendDialsInFlight == 0 {
+		result.MaxBackendDialsInFlight = minInt(
+			global.MaxBackendDialsInFlight,
+			result.MaxStreams)
+	}
+	if result.NewSessionsPerMinute == 0 {
+		result.NewSessionsPerMinute = global.NewSessionsPerMinute
+	}
+	if result.NewSessionsBurst == 0 {
+		result.NewSessionsBurst = global.NewSessionsBurst
+	}
+	if result.NewStreamsPerMinute == 0 {
+		result.NewStreamsPerMinute = global.NewStreamsPerMinute
+	}
+	if result.NewStreamsBurst == 0 {
+		result.NewStreamsBurst = global.NewStreamsBurst
+	}
+	if result.MaxStreamsPerSession == 0 {
+		result.MaxStreamsPerSession = minInt(
+			global.MaxStreamsPerSession,
+			result.MaxStreams)
+	}
+	if result.MaxPendingPerSession == 0 {
+		result.MaxPendingPerSession = global.MaxPendingPerSession
+	}
+	return result
 }
 
 func Defaults() Config {
@@ -121,14 +168,18 @@ func Defaults() Config {
 			MaxPendingGlobal:          512 * 1024 * 1024,
 			MaxPendingItemsPerSession: 16 * 1024,
 			MaxPendingItemsGlobal:     256 * 1024,
-			MaxSessionsPerIP:          4,
+			MaxSessionsPerIP:          0,
 			MaxSessionsGlobal:         128,
-			NewSessionsPerMinute:      10,
-			NewSessionsBurst:          4,
-			MaxBootstrapsPerIP:        8,
+			MaxStreamsGlobal:          4096,
+			MaxBackendDialsInFlight:   256,
+			NewSessionsPerMinute:      600,
+			NewSessionsBurst:          128,
+			NewStreamsPerMinute:       6000,
+			NewStreamsBurst:           512,
+			MaxBootstrapsPerIP:        0,
 			MaxBootstrapsGlobal:       512,
-			NewBootstrapsPerMinute:    30,
-			NewBootstrapsBurst:        8,
+			NewBootstrapsPerMinute:    1200,
+			NewBootstrapsBurst:        256,
 			MaxProfiles:               32,
 		},
 		Timeouts: Timeouts{
@@ -213,9 +264,11 @@ func (c Config) validate() error {
 		c.Limits.MaxStreamsPerSession, c.Limits.MaxClosedStreamIDs,
 		c.Limits.MaxPendingPerSession, c.Limits.MaxPendingGlobal,
 		c.Limits.MaxPendingItemsPerSession, c.Limits.MaxPendingItemsGlobal,
-		c.Limits.MaxSessionsPerIP, c.Limits.MaxSessionsGlobal,
+		c.Limits.MaxSessionsGlobal, c.Limits.MaxStreamsGlobal,
+		c.Limits.MaxBackendDialsInFlight,
 		c.Limits.NewSessionsPerMinute, c.Limits.NewSessionsBurst,
-		c.Limits.MaxBootstrapsPerIP, c.Limits.MaxBootstrapsGlobal,
+		c.Limits.NewStreamsPerMinute, c.Limits.NewStreamsBurst,
+		c.Limits.MaxBootstrapsGlobal,
 		c.Limits.NewBootstrapsPerMinute, c.Limits.NewBootstrapsBurst,
 		c.Limits.MaxProfiles,
 	}
@@ -224,7 +277,15 @@ func (c Config) validate() error {
 			return errors.New("all resource limits must be positive")
 		}
 	}
-	if c.Limits.MaxPendingGlobal < c.Limits.MaxPendingPerSession || c.Limits.MaxPendingItemsGlobal < c.Limits.MaxPendingItemsPerSession || c.Limits.MaxSessionsGlobal < c.Limits.MaxSessionsPerIP || c.Limits.MaxBootstrapsGlobal < c.Limits.MaxBootstrapsPerIP {
+	if c.Limits.MaxSessionsPerIP < 0 || c.Limits.MaxBootstrapsPerIP < 0 {
+		return errors.New("per-IP limits must not be negative")
+	}
+	if c.Limits.MaxPendingGlobal < c.Limits.MaxPendingPerSession ||
+		c.Limits.MaxPendingItemsGlobal < c.Limits.MaxPendingItemsPerSession ||
+		c.Limits.MaxSessionsGlobal < c.Limits.MaxSessionsPerIP ||
+		c.Limits.MaxStreamsGlobal < c.Limits.MaxStreamsPerSession ||
+		c.Limits.MaxStreamsGlobal < c.Limits.MaxBackendDialsInFlight ||
+		c.Limits.MaxBootstrapsGlobal < c.Limits.MaxBootstrapsPerIP {
 		return errors.New("global limits must not be smaller than per-session or per-IP limits")
 	}
 	durations := []time.Duration{
@@ -362,12 +423,10 @@ func loadProfiles(path, host string, limits Limits) ([]Profile, error) {
 		if err := validateLoopbackAddress(input.Backend); err != nil {
 			return nil, fmt.Errorf("profile %q backend: %w", input.Name, err)
 		}
-		if input.Limits.MaxStreamsPerSession < 0 || input.Limits.MaxStreamsPerSession > limits.MaxStreamsPerSession {
-			return nil, fmt.Errorf("profile %q max_streams_per_session must be between 0 and %d", input.Name, limits.MaxStreamsPerSession)
+		if err := validateProfileLimits(input.Limits, limits); err != nil {
+			return nil, fmt.Errorf("profile %q: %w", input.Name, err)
 		}
-		if input.Limits.MaxPendingPerSession < 0 || input.Limits.MaxPendingPerSession > limits.MaxPendingPerSession {
-			return nil, fmt.Errorf("profile %q max_pending_per_session must be between 0 and %d", input.Name, limits.MaxPendingPerSession)
-		}
+		profileLimits := input.Limits.WithDefaults(limits)
 		secret, err := DecodeSecret(input.Secret)
 		if err != nil {
 			return nil, fmt.Errorf("profile %q: %w", input.Name, err)
@@ -383,12 +442,50 @@ func loadProfiles(path, host string, limits Limits) ([]Profile, error) {
 			Name:       input.Name,
 			Backend:    input.Backend,
 			Capability: capability,
-			Limits:     input.Limits,
+			Limits:     profileLimits,
 		})
 		names[input.Name] = struct{}{}
 		capabilities[capability] = struct{}{}
 	}
 	return result, nil
+}
+
+func validateProfileLimits(value ProfileLimits, global Limits) error {
+	checks := []struct {
+		name  string
+		value int
+		limit int
+	}{
+		{"max_sessions", value.MaxSessions, global.MaxSessionsGlobal},
+		{"max_streams", value.MaxStreams, global.MaxStreamsGlobal},
+		{"max_backend_dials_in_flight", value.MaxBackendDialsInFlight, global.MaxBackendDialsInFlight},
+		{"new_sessions_per_minute", value.NewSessionsPerMinute, global.NewSessionsPerMinute},
+		{"new_sessions_burst", value.NewSessionsBurst, global.NewSessionsBurst},
+		{"new_streams_per_minute", value.NewStreamsPerMinute, global.NewStreamsPerMinute},
+		{"new_streams_burst", value.NewStreamsBurst, global.NewStreamsBurst},
+		{"max_streams_per_session", value.MaxStreamsPerSession, global.MaxStreamsPerSession},
+		{"max_pending_per_session", value.MaxPendingPerSession, global.MaxPendingPerSession},
+	}
+	for _, check := range checks {
+		if check.value < 0 || check.value > check.limit {
+			return fmt.Errorf("%s must be between 0 and %d", check.name, check.limit)
+		}
+	}
+	resolved := value.WithDefaults(global)
+	if resolved.MaxStreamsPerSession > resolved.MaxStreams {
+		return errors.New("max_streams_per_session must not exceed max_streams")
+	}
+	if resolved.MaxBackendDialsInFlight > resolved.MaxStreams {
+		return errors.New("max_backend_dials_in_flight must not exceed max_streams")
+	}
+	return nil
+}
+
+func minInt(first, second int) int {
+	if first < second {
+		return first
+	}
+	return second
 }
 
 func isSystemdCredential(path string) bool {

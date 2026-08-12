@@ -120,4 +120,4 @@ if curl --fail --silent --output /dev/null "$ready"; then
 else
 	echo "Health: ok; readiness: backend unavailable (unchanged from before update)"
 fi
-echo "Existing browser sessions were invalidated; use Open browser in Telegram Desktop."
+echo "Existing carrier sessions were invalidated; the hidden WebView will reconnect automatically."

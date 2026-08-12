@@ -575,12 +575,31 @@ func TestBootstrapLimitsExpiryAndConsumption(t *testing.T) {
 	}
 }
 
-func TestBootstrapRateAndGlobalEviction(t *testing.T) {
+func TestBootstrapRateIsGlobal(t *testing.T) {
 	configuration := testConfig("127.0.0.1:1")
 	configuration.Limits.MaxBootstrapsPerIP = 10
-	configuration.Limits.MaxBootstrapsGlobal = 2
+	configuration.Limits.MaxBootstrapsGlobal = 10
 	configuration.Limits.NewBootstrapsBurst = 2
 	configuration.Limits.NewBootstrapsPerMinute = 1
+	manager := NewManager(configuration)
+	defer manager.Shutdown()
+	profile := &configuration.Profiles[0]
+	if _, err := manager.IssueBootstrap(profile, "198.51.100.13"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.IssueBootstrap(profile, "198.51.100.13"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.IssueBootstrap(profile, "198.51.100.14"); !errors.Is(err, ErrLimit) {
+		t.Fatalf("global bootstrap creation rate was not enforced: %v", err)
+	}
+}
+
+func TestGlobalBootstrapPoolEvictsOldestUnusedEntry(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Limits.MaxBootstrapsGlobal = 2
+	configuration.Limits.NewBootstrapsBurst = 10
+	configuration.Limits.NewBootstrapsPerMinute = 600
 	manager := NewManager(configuration)
 	defer manager.Shutdown()
 	profile := &configuration.Profiles[0]
@@ -591,15 +610,181 @@ func TestBootstrapRateAndGlobalEviction(t *testing.T) {
 	if _, err := manager.IssueBootstrap(profile, "198.51.100.13"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.IssueBootstrap(profile, "198.51.100.13"); !errors.Is(err, ErrLimit) {
-		t.Fatalf("bootstrap creation rate was not enforced: %v", err)
-	}
 	if _, err := manager.IssueBootstrap(profile, "198.51.100.14"); err != nil {
 		t.Fatalf("global bootstrap pool did not evict an unused entry: %v", err)
 	}
 	if _, err := manager.Create(oldest, "198.51.100.13", frame.Encode(frame.Hello, 0, []byte{1})); !errors.Is(err, ErrAuthentication) {
 		t.Fatalf("evicted bootstrap was accepted: %v", err)
 	}
+}
+
+func TestDisabledPerIPSessionLimitAllowsSharedAddress(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Limits.MaxSessionsPerIP = 0
+	configuration.Limits.MaxSessionsGlobal = 8
+	configuration.Limits.NewSessionsBurst = 8
+	configuration.Limits.NewSessionsPerMinute = 600
+	manager := NewManager(configuration)
+	defer manager.Shutdown()
+	for index := 0; index != 5; index++ {
+		bootstrap, err := manager.IssueBootstrap(
+			&configuration.Profiles[0],
+			"198.51.100.20")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manager.Create(
+			bootstrap,
+			"198.51.100.20",
+			frame.Encode(frame.Hello, 0, []byte{1})); err != nil {
+			t.Fatalf("shared source address was limited at session %d: %v", index, err)
+		}
+	}
+}
+
+func TestProfileSessionLimitDoesNotConsumeGlobalCapacity(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Limits.MaxSessionsGlobal = 4
+	configuration.Limits.NewSessionsBurst = 10
+	configuration.Limits.NewSessionsPerMinute = 600
+	configuration.Profiles[0].Limits.MaxSessions = 1
+	secondSecret, _ := hex.DecodeString("101112131415161718191a1b1c1d1e1f")
+	configuration.Profiles = append(configuration.Profiles, config.Profile{
+		Name:       "second",
+		Backend:    "127.0.0.1:1",
+		Capability: config.DeriveCapability("proxy.example.com", secondSecret),
+	})
+	manager := NewManager(configuration)
+	defer manager.Shutdown()
+	hello := frame.Encode(frame.Hello, 0, []byte{1})
+	firstBootstrap, err := manager.IssueBootstrap(
+		&configuration.Profiles[0],
+		"198.51.100.22")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Create(firstBootstrap, "198.51.100.22", hello); err != nil {
+		t.Fatal(err)
+	}
+	limitedBootstrap, err := manager.IssueBootstrap(
+		&configuration.Profiles[0],
+		"198.51.100.23")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Create(limitedBootstrap, "198.51.100.23", hello); !errors.Is(err, ErrLimit) {
+		t.Fatalf("profile session ceiling was not enforced: %v", err)
+	}
+	secondBootstrap, err := manager.IssueBootstrap(
+		&configuration.Profiles[1],
+		"198.51.100.24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Create(secondBootstrap, "198.51.100.24", hello); err != nil {
+		t.Fatalf("one profile's limit blocked another profile: %v", err)
+	}
+}
+
+func TestSessionCreationRateIsGlobal(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Limits.NewSessionsBurst = 1
+	configuration.Limits.NewSessionsPerMinute = 1
+	manager := NewManager(configuration)
+	defer manager.Shutdown()
+	hello := frame.Encode(frame.Hello, 0, []byte{1})
+	for index, clientIP := range []string{"198.51.100.25", "198.51.100.26"} {
+		bootstrap, err := manager.IssueBootstrap(
+			&configuration.Profiles[0],
+			clientIP)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = manager.Create(bootstrap, clientIP, hello)
+		if index == 0 && err != nil {
+			t.Fatal(err)
+		}
+		if index == 1 && !errors.Is(err, ErrLimit) {
+			t.Fatalf("global session creation rate was not enforced: %v", err)
+		}
+	}
+}
+
+func TestStreamLimitRejectsOnlyTheNewStream(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Limits.MaxStreamsGlobal = 1
+	configuration.Limits.MaxBackendDialsInFlight = 1
+	configuration.Limits.NewStreamsBurst = 10
+	configuration.Limits.NewStreamsPerMinute = 600
+	manager := NewManager(configuration)
+	defer manager.Shutdown()
+	bootstrap, err := manager.IssueBootstrap(
+		&configuration.Profiles[0],
+		"198.51.100.21")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := manager.Create(
+		bootstrap,
+		"198.51.100.21",
+		frame.Encode(frame.Hello, 0, []byte{1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := append(
+		frame.Encode(frame.Open, 30, nil),
+		frame.Encode(frame.Open, 31, nil)...)
+	if _, err := created.Session.ProcessUp(1, body); err != nil {
+		t.Fatal(err)
+	}
+	down, _, err := created.Session.Poll(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames, err := frame.ParseAll(down, frame.MaxPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, value := range frames {
+		if value.Type == frame.Close && value.StreamID == 31 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("rejected stream did not receive CLOSE: %v", frames)
+	}
+	if _, err := manager.Get(created.Token); err != nil {
+		t.Fatal("stream admission limit closed the parent session")
+	}
+	metrics := manager.Metrics()
+	if metrics.StreamsOpened != 1 || metrics.StreamsRejected != 1 {
+		t.Fatalf("unexpected stream metrics: %#v", metrics)
+	}
+}
+
+func TestBackendDialLimitReopensAfterDialCompletes(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Limits.MaxStreamsGlobal = 2
+	configuration.Limits.MaxBackendDialsInFlight = 1
+	configuration.Limits.NewStreamsBurst = 10
+	configuration.Limits.NewStreamsPerMinute = 600
+	manager := NewManager(configuration)
+	defer manager.Shutdown()
+	profile := manager.MatchCapability(configuration.Profiles[0].Capability[:])
+	if profile == nil || !manager.acquireStream(profile) {
+		t.Fatal("first stream was not admitted")
+	}
+	if manager.acquireStream(profile) {
+		t.Fatal("dial-in-flight ceiling admitted a second stream")
+	}
+	manager.backendDialFinished(profile, false)
+	if !manager.acquireStream(profile) {
+		t.Fatal("completed dial did not reopen dial capacity")
+	}
+	manager.backendDialFinished(profile, false)
+	manager.streamFinished(profile)
+	manager.streamFinished(profile)
 }
 
 func testSession(t *testing.T) (*Manager, string, *Session) {

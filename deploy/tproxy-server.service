@@ -13,6 +13,7 @@ ExecStart=/usr/local/bin/tproxy-server -config /etc/tproxy-server/config.json
 Restart=on-failure
 RestartSec=3s
 TimeoutStopSec=20s
+LimitNOFILE=1048576
 NoNewPrivileges=true
 PrivateDevices=true
 PrivateTmp=true

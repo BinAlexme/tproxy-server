@@ -46,51 +46,77 @@ type rateState struct {
 }
 
 type Metrics struct {
-	SessionsCreated uint64
-	SessionsClosed  uint64
-	StreamsOpened   uint64
-	BytesUp         uint64
-	BytesDown       uint64
-	LimitHits       uint64
+	SessionsCreated     uint64
+	SessionsClosed      uint64
+	StreamsOpened       uint64
+	StreamsRejected     uint64
+	BackendDialFailures uint64
+	BytesUp             uint64
+	BytesDown           uint64
+	LimitHits           uint64
+}
+
+type Capacity struct {
+	Sessions             int
+	Streams              int
+	BackendDialsInFlight int
+	PendingBytes         int64
+	PendingItems         int64
 }
 
 type Manager struct {
 	config config.Config
 
-	mu                 sync.Mutex
-	bootstraps         map[[sha256.Size]byte]*bootstrap
-	bootstrapsPerIP    map[string]int
-	sessions           map[[sha256.Size]byte]*Session
-	closedTokens       map[[sha256.Size]byte]time.Time
-	sessionsPerIP      map[string]int
-	rates              map[string]rateState
-	bootstrapRates     map[string]rateState
-	pendingGlobalCost  int64
-	pendingGlobalItems int64
-	closed             bool
-	stop               chan struct{}
-	done               chan struct{}
+	mu                   sync.Mutex
+	bootstraps           map[[sha256.Size]byte]*bootstrap
+	bootstrapsPerIP      map[string]int
+	sessions             map[[sha256.Size]byte]*Session
+	closedTokens         map[[sha256.Size]byte]time.Time
+	sessionsPerIP        map[string]int
+	sessionsPerProfile   map[string]int
+	streamsPerProfile    map[string]int
+	dialsPerProfile      map[string]int
+	bootstrapRate        rateState
+	sessionRate          rateState
+	streamRate           rateState
+	profileSessionRates  map[string]rateState
+	profileStreamRates   map[string]rateState
+	streamsLive          int
+	backendDialsInFlight int
+	pendingGlobalCost    int64
+	pendingGlobalItems   int64
+	closed               bool
+	stop                 chan struct{}
+	done                 chan struct{}
 
-	sessionsCreated atomic.Uint64
-	sessionsClosed  atomic.Uint64
-	streamsOpened   atomic.Uint64
-	bytesUp         atomic.Uint64
-	bytesDown       atomic.Uint64
-	limitHits       atomic.Uint64
+	sessionsCreated     atomic.Uint64
+	sessionsClosed      atomic.Uint64
+	streamsOpened       atomic.Uint64
+	streamsRejected     atomic.Uint64
+	backendDialFailures atomic.Uint64
+	bytesUp             atomic.Uint64
+	bytesDown           atomic.Uint64
+	limitHits           atomic.Uint64
 }
 
 func NewManager(value config.Config) *Manager {
+	for i := range value.Profiles {
+		value.Profiles[i].Limits = value.Profiles[i].Limits.WithDefaults(value.Limits)
+	}
 	result := &Manager{
-		config:          value,
-		bootstraps:      make(map[[sha256.Size]byte]*bootstrap),
-		bootstrapsPerIP: make(map[string]int),
-		sessions:        make(map[[sha256.Size]byte]*Session),
-		closedTokens:    make(map[[sha256.Size]byte]time.Time),
-		sessionsPerIP:   make(map[string]int),
-		rates:           make(map[string]rateState),
-		bootstrapRates:  make(map[string]rateState),
-		stop:            make(chan struct{}),
-		done:            make(chan struct{}),
+		config:              value,
+		bootstraps:          make(map[[sha256.Size]byte]*bootstrap),
+		bootstrapsPerIP:     make(map[string]int),
+		sessions:            make(map[[sha256.Size]byte]*Session),
+		closedTokens:        make(map[[sha256.Size]byte]time.Time),
+		sessionsPerIP:       make(map[string]int),
+		sessionsPerProfile:  make(map[string]int),
+		streamsPerProfile:   make(map[string]int),
+		dialsPerProfile:     make(map[string]int),
+		profileSessionRates: make(map[string]rateState),
+		profileStreamRates:  make(map[string]rateState),
+		stop:                make(chan struct{}),
+		done:                make(chan struct{}),
 	}
 	go result.cleanupLoop()
 	return result
@@ -114,6 +140,13 @@ func (m *Manager) MatchCapability(value []byte) *config.Profile {
 }
 
 func (m *Manager) IssueBootstrap(profile *config.Profile, clientIP string) (string, error) {
+	if profile == nil {
+		return "", ErrAuthentication
+	}
+	profile = m.MatchCapability(profile.Capability[:])
+	if profile == nil {
+		return "", ErrAuthentication
+	}
 	now := time.Now()
 	token, hash, err := newToken()
 	if err != nil {
@@ -125,9 +158,9 @@ func (m *Manager) IssueBootstrap(profile *config.Profile, clientIP string) (stri
 		return "", ErrClosed
 	}
 	m.removeExpiredBootstrapsLocked(now)
-	if m.bootstrapsPerIP[clientIP] >= m.config.Limits.MaxBootstrapsPerIP || !allowRateLocked(
-		m.bootstrapRates,
-		clientIP,
+	if (m.config.Limits.MaxBootstrapsPerIP != 0 &&
+		m.bootstrapsPerIP[clientIP] >= m.config.Limits.MaxBootstrapsPerIP) || !allowRateLocked(
+		&m.bootstrapRate,
 		now,
 		m.config.Limits.NewBootstrapsPerMinute,
 		m.config.Limits.NewBootstrapsBurst) {
@@ -175,16 +208,24 @@ func (m *Manager) Create(token, clientIP string, body []byte) (CreateResult, err
 			Session: entry.session,
 		}, nil
 	}
-	if m.closed || len(m.sessions) >= m.config.Limits.MaxSessionsGlobal || m.sessionsPerIP[clientIP] >= m.config.Limits.MaxSessionsPerIP {
+	profileLimits := entry.profile.Limits
+	if m.closed ||
+		len(m.sessions) >= m.config.Limits.MaxSessionsGlobal ||
+		m.sessionsPerProfile[entry.profile.Name] >= profileLimits.MaxSessions ||
+		(m.config.Limits.MaxSessionsPerIP != 0 &&
+			m.sessionsPerIP[clientIP] >= m.config.Limits.MaxSessionsPerIP) {
 		m.limitHits.Add(1)
 		return CreateResult{}, ErrLimit
 	}
-	if !allowRateLocked(
-		m.rates,
-		clientIP,
+	if !allowProfileRateLocked(
+		&m.sessionRate,
+		m.profileSessionRates,
+		entry.profile.Name,
 		now,
 		m.config.Limits.NewSessionsPerMinute,
-		m.config.Limits.NewSessionsBurst) {
+		m.config.Limits.NewSessionsBurst,
+		profileLimits.NewSessionsPerMinute,
+		profileLimits.NewSessionsBurst) {
 		m.limitHits.Add(1)
 		return CreateResult{}, ErrLimit
 	}
@@ -193,25 +234,30 @@ func (m *Manager) Create(token, clientIP string, body []byte) (CreateResult, err
 		return CreateResult{}, err
 	}
 	limits := m.config.Limits
-	if entry.profile.Limits.MaxStreamsPerSession != 0 {
-		limits.MaxStreamsPerSession = entry.profile.Limits.MaxStreamsPerSession
-	}
-	if entry.profile.Limits.MaxPendingPerSession != 0 {
-		limits.MaxPendingPerSession = entry.profile.Limits.MaxPendingPerSession
-	}
+	limits.MaxStreamsPerSession = profileLimits.MaxStreamsPerSession
+	limits.MaxPendingPerSession = profileLimits.MaxPendingPerSession
 	created := newSession(sessionOptions{
-		profile:    entry.profile,
-		clientIP:   clientIP,
-		limits:     limits,
-		timeouts:   m.config.Timeouts,
-		budget:     m.changePendingBudget,
-		onFinished: m.sessionFinished,
-		onStream:   func() { m.streamsOpened.Add(1) },
-		onUp:       func(count int) { m.bytesUp.Add(uint64(count)) },
-		onDown:     func(count int) { m.bytesDown.Add(uint64(count)) },
+		profile:       entry.profile,
+		clientIP:      clientIP,
+		limits:        limits,
+		timeouts:      m.config.Timeouts,
+		budget:        m.changePendingBudget,
+		onFinished:    m.sessionFinished,
+		acquireStream: func() bool { return m.acquireStream(entry.profile) },
+		onBackendDialFinished: func(failed bool) {
+			m.backendDialFinished(entry.profile, failed)
+		},
+		onStreamFinished: func() { m.streamFinished(entry.profile) },
+		onStreamRejected: func() {
+			m.streamsRejected.Add(1)
+			m.limitHits.Add(1)
+		},
+		onUp:   func(count int) { m.bytesUp.Add(uint64(count)) },
+		onDown: func(count int) { m.bytesDown.Add(uint64(count)) },
 	})
 	m.sessions[sessionHash] = created
 	m.sessionsPerIP[clientIP]++
+	m.sessionsPerProfile[entry.profile.Name]++
 	m.releaseUnusedBootstrapLocked(entry)
 	entry.used = true
 	entry.bodyDigest = bodyDigest
@@ -260,19 +306,27 @@ func (m *Manager) CloseToken(token string) error {
 
 func (m *Manager) Metrics() Metrics {
 	return Metrics{
-		SessionsCreated: m.sessionsCreated.Load(),
-		SessionsClosed:  m.sessionsClosed.Load(),
-		StreamsOpened:   m.streamsOpened.Load(),
-		BytesUp:         m.bytesUp.Load(),
-		BytesDown:       m.bytesDown.Load(),
-		LimitHits:       m.limitHits.Load(),
+		SessionsCreated:     m.sessionsCreated.Load(),
+		SessionsClosed:      m.sessionsClosed.Load(),
+		StreamsOpened:       m.streamsOpened.Load(),
+		StreamsRejected:     m.streamsRejected.Load(),
+		BackendDialFailures: m.backendDialFailures.Load(),
+		BytesUp:             m.bytesUp.Load(),
+		BytesDown:           m.bytesDown.Load(),
+		LimitHits:           m.limitHits.Load(),
 	}
 }
 
-func (m *Manager) LiveSessions() int {
+func (m *Manager) Capacity() Capacity {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return len(m.sessions)
+	return Capacity{
+		Sessions:             len(m.sessions),
+		Streams:              m.streamsLive,
+		BackendDialsInFlight: m.backendDialsInFlight,
+		PendingBytes:         m.pendingGlobalCost,
+		PendingItems:         m.pendingGlobalItems,
+	}
 }
 
 func (m *Manager) Shutdown() {
@@ -319,6 +373,10 @@ func (m *Manager) sessionFinished(value *Session) {
 			if m.sessionsPerIP[value.clientIP] == 0 {
 				delete(m.sessionsPerIP, value.clientIP)
 			}
+			m.sessionsPerProfile[value.profile.Name]--
+			if m.sessionsPerProfile[value.profile.Name] == 0 {
+				delete(m.sessionsPerProfile, value.profile.Name)
+			}
 			break
 		}
 	}
@@ -329,6 +387,70 @@ func (m *Manager) sessionFinished(value *Session) {
 	}
 	m.mu.Unlock()
 	m.sessionsClosed.Add(1)
+}
+
+func (m *Manager) acquireStream(profile *config.Profile) bool {
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	limits := profile.Limits
+	if m.closed ||
+		m.streamsLive >= m.config.Limits.MaxStreamsGlobal ||
+		m.backendDialsInFlight >= m.config.Limits.MaxBackendDialsInFlight ||
+		m.streamsPerProfile[profile.Name] >= limits.MaxStreams ||
+		m.dialsPerProfile[profile.Name] >= limits.MaxBackendDialsInFlight {
+		return false
+	}
+	if !allowProfileRateLocked(
+		&m.streamRate,
+		m.profileStreamRates,
+		profile.Name,
+		now,
+		m.config.Limits.NewStreamsPerMinute,
+		m.config.Limits.NewStreamsBurst,
+		limits.NewStreamsPerMinute,
+		limits.NewStreamsBurst) {
+		return false
+	}
+	m.streamsLive++
+	m.backendDialsInFlight++
+	m.streamsPerProfile[profile.Name]++
+	m.dialsPerProfile[profile.Name]++
+	m.streamsOpened.Add(1)
+	return true
+}
+
+func (m *Manager) backendDialFinished(
+	profile *config.Profile,
+	failed bool) {
+	m.mu.Lock()
+	if m.backendDialsInFlight <= 0 || m.dialsPerProfile[profile.Name] <= 0 {
+		m.mu.Unlock()
+		panic("invalid backend dial accounting")
+	}
+	m.backendDialsInFlight--
+	m.dialsPerProfile[profile.Name]--
+	if m.dialsPerProfile[profile.Name] == 0 {
+		delete(m.dialsPerProfile, profile.Name)
+	}
+	m.mu.Unlock()
+	if failed {
+		m.backendDialFailures.Add(1)
+	}
+}
+
+func (m *Manager) streamFinished(profile *config.Profile) {
+	m.mu.Lock()
+	if m.streamsLive <= 0 || m.streamsPerProfile[profile.Name] <= 0 {
+		m.mu.Unlock()
+		panic("invalid stream accounting")
+	}
+	m.streamsLive--
+	m.streamsPerProfile[profile.Name]--
+	if m.streamsPerProfile[profile.Name] == 0 {
+		delete(m.streamsPerProfile, profile.Name)
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) changePendingBudget(
@@ -405,12 +527,47 @@ func (m *Manager) evictOldestUnusedBootstrapLocked() bool {
 }
 
 func allowRateLocked(
-	states map[string]rateState,
-	clientIP string,
+	state *rateState,
 	now time.Time,
 	perMinute int,
 	burstLimit int) bool {
-	state := states[clientIP]
+	updated, allowed := takeRate(*state, now, perMinute, burstLimit)
+	*state = updated
+	return allowed
+}
+
+func allowProfileRateLocked(
+	global *rateState,
+	profiles map[string]rateState,
+	profile string,
+	now time.Time,
+	globalPerMinute int,
+	globalBurst int,
+	profilePerMinute int,
+	profileBurst int) bool {
+	updatedGlobal, globalAllowed := takeRate(
+		*global,
+		now,
+		globalPerMinute,
+		globalBurst)
+	updatedProfile, profileAllowed := takeRate(
+		profiles[profile],
+		now,
+		profilePerMinute,
+		profileBurst)
+	if !globalAllowed || !profileAllowed {
+		return false
+	}
+	*global = updatedGlobal
+	profiles[profile] = updatedProfile
+	return true
+}
+
+func takeRate(
+	state rateState,
+	now time.Time,
+	perMinute int,
+	burstLimit int) (rateState, bool) {
 	burst := float64(burstLimit)
 	if state.last.IsZero() {
 		state.tokens = burst
@@ -424,12 +581,10 @@ func allowRateLocked(
 		state.last = now
 	}
 	if state.tokens < 1 {
-		states[clientIP] = state
-		return false
+		return state, false
 	}
 	state.tokens--
-	states[clientIP] = state
-	return true
+	return state, true
 }
 
 func (m *Manager) cleanupLoop() {
@@ -469,33 +624,6 @@ func (m *Manager) removeExpiredBootstrapsLocked(now time.Time) {
 	for hash, expires := range m.closedTokens {
 		if now.After(expires) {
 			delete(m.closedTokens, hash)
-		}
-	}
-	removeIdleRatesLocked(
-		m.rates,
-		m.sessionsPerIP,
-		now,
-		m.config.Limits.NewSessionsPerMinute,
-		m.config.Limits.NewSessionsBurst)
-	removeIdleRatesLocked(
-		m.bootstrapRates,
-		m.bootstrapsPerIP,
-		now,
-		m.config.Limits.NewBootstrapsPerMinute,
-		m.config.Limits.NewBootstrapsBurst)
-}
-
-func removeIdleRatesLocked(
-	states map[string]rateState,
-	active map[string]int,
-	now time.Time,
-	perMinute int,
-	burst int) {
-	refill := time.Duration(
-		float64(time.Minute) * float64(burst) / float64(perMinute))
-	for clientIP, state := range states {
-		if active[clientIP] == 0 && now.Sub(state.last) > refill {
-			delete(states, clientIP)
 		}
 	}
 }

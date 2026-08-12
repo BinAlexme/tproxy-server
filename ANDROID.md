@@ -2,8 +2,8 @@
 
 This document maps the WEB proxy carrier onto the official Telegram Android
 source at `../Other/Telegram-Android`. The proof of concept deliberately reuses
-Android tgnet's existing MTProxy transform and keeps the public relay protocol
-compatible with Telegram Desktop.
+Android tgnet's existing MTProxy transform and implements the shared, client-neutral
+relay protocol in `PROTOCOL.md`.
 
 ## Chosen architecture
 
@@ -69,13 +69,14 @@ The relay endpoints, session model, authentication, limits, and Caddy deployment
 not change. The generated bridge page now has two mutually exclusive initialization
 paths:
 
-1. the existing loopback-parent `MessageChannel` used by Telegram Desktop; or
+1. the loopback-parent `MessageChannel` used by optional browser carriers; or
 2. the exact-origin `TelegramWebProxy` object injected by AndroidX WebKit when the
    URL contains a canonical `#android=<43-character nonce>` fragment.
 
 Control objects are JSON strings at the Android boundary. Binary messages are one
 complete shared frame. See `PROTOCOL.md` for the normative boundary. Existing
-desktop bridge URLs have no Android fragment and continue down the original path.
+loopback-parent bridge URLs have no WebView fragment and continue down the original
+path.
 
 No configuration, deployment, or Caddy change is required. A server must be updated
 to a build containing the Android bridge-page extension before the Android client
@@ -151,7 +152,7 @@ not publication.
 
 ## Test sequence
 
-1. Deploy the updated relay and confirm the desktop client still connects.
+1. Deploy the updated relay and confirm an existing WEB client still connects.
 2. Install the debug APK and ensure Android System WebView is current.
 3. Add a WEB proxy with the deployed hostname and the same MTProxy secret.
 4. Enable it in the foreground. The proxy row should move from connecting to the

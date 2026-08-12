@@ -1,7 +1,15 @@
 # WEB proxy protocol v1
 
-This is the wire contract shared by Telegram Desktop, the browser bridge, and
-`tproxy-server`. All binary integers are unsigned and big-endian.
+This is the client-independent wire contract shared by a WEB-capable Telegram app,
+the HTTPS bridge page, and `tproxy-server`. All binary integers are unsigned and
+big-endian.
+
+A client applies Telegram's normal MTProxy transform first. Its local WEB adapter
+maps every resulting TCP connection to a logical stream and multiplexes those
+streams through one WebView carrier session. The bridge page converts complete
+shared-frame batches into authenticated HTTPS requests; the relay converts each
+logical stream back into one TCP connection to its configured stock MTProxy. DATA
+payloads are opaque at every layer after the app's MTProxy transform.
 
 ## Bridge URL
 
@@ -25,9 +33,64 @@ Vectors:
 Only an exact `GET /` with one canonical 43-character `bridge` parameter selects
 the bridge. Every other root query returns the normal public index.
 
-## MessageChannel boundary
+`tdesktop-web-proxy-bridge-v1` is a frozen v1 domain-separation label. Its name is
+retained for compatibility and does not restrict the protocol to Telegram Desktop.
 
-The local tdesktop page embeds the HTTPS bridge page and transfers one port:
+## Client-to-bridge boundary
+
+The bridge supports two ways to connect a Telegram app to the same carrier logic.
+A normal native implementation uses the injected WebView boundary. The loopback
+parent boundary is retained for clients that deliberately use a system browser as
+a carrier or fallback. Neither boundary changes the HTTP or shared-frame protocol.
+
+### Injected WebView boundary
+
+The app loads the bridge document as the WebView main frame and appends a
+client-only fragment:
+
+```text
+https://H/?bridge=bridge#android=webview-nonce
+```
+
+`webview-nonce` is 32 random bytes in canonical unpadded base64url form. The
+`android` fragment key is a frozen v1 compatibility name used by all current
+reference clients; it does not identify the client platform. URL fragments are not
+sent in the HTTPS request.
+
+Before navigation, the app exposes a page object named `TelegramWebProxy` only to
+the exact `https://H` main frame. The object has a `postMessage(value)` method used
+by the page and an `onmessage` callback used by the app. The platform binding must
+authenticate the active WebView, main frame, exact origin, current navigation, and
+nonce. Wildcard origins and unrestricted JavaScript interfaces are not conforming.
+
+The bridge removes the query and fragment with `history.replaceState`, adapts the
+object to its internal port contract, and sends this JSON control value:
+
+```json
+{"t":"tproxy-android-init","v":1,"nonce":"webview-nonce"}
+```
+
+`tproxy-android-init` is also a frozen v1 compatibility name. The app accepts it
+only when the nonce and authenticated WebView context match. Messages from the
+bridge to the app are either JSON control values or one complete shared frame.
+Messages from the app to the bridge use the same representations. A platform may
+use ArrayBuffer, a shared native buffer, or a private base64 envelope across its
+WebView IPC boundary; that private encoding is removed before the value reaches the
+bridge and is not part of the HTTP carrier or shared-frame format.
+
+The bridge splits an aggregated HTTP downlink body at validated frame boundaries
+before sending frames through this direct WebView boundary. Clients should keep
+DATA frames at or below the relay's 64 KiB chunk size.
+
+Each platform binds this object through its origin-scoped native WebView API. Some
+bindings carry ArrayBuffers directly; others use a private string/base64 or shared
+buffer shim. The platform documents linked below describe those implementation
+choices without changing this boundary.
+
+### Loopback parent boundary
+
+A client-controlled loopback page may embed the HTTPS bridge page and transfer one
+`MessagePort`:
 
 ```javascript
 iframe.contentWindow.postMessage(
@@ -44,59 +107,6 @@ batches. Control objects are `{t:'status',state}`, diagnostic
 `{t:'traffic',up,down}` byte counts, and `{t:'close'}`. Traffic counts are
 nonnegative numbers describing the completed carrier operation; clients may
 discard them after validation.
-
-## Android WebView boundary
-
-An Android client may load the same bridge document as the WebView main frame and
-append a client-only fragment:
-
-```text
-https://H/?bridge=bridge#android=android-nonce
-```
-
-`android-nonce` is 32 random bytes in canonical unpadded base64url form. It is not
-sent in the HTTPS request. Before navigation, the app injects a WebMessage listener
-named `TelegramWebProxy` for exactly the `https://H` origin. Both
-`WEB_MESSAGE_LISTENER` and `WEB_MESSAGE_ARRAY_BUFFER` must be supported by the
-installed Android System WebView. A wildcard origin or `addJavascriptInterface` is
-not part of this protocol.
-
-The bridge removes the query and fragment with `history.replaceState`, adapts the
-injected listener to its internal port contract, and sends this JSON string:
-
-```json
-{"t":"tproxy-android-init","v":1,"nonce":"android-nonce"}
-```
-
-The app accepts it only from the main frame, only from the exact configured HTTPS
-origin, and only when the nonce matches the value it generated. Messages from the
-bridge to the app are either JSON-encoded control strings or an ArrayBuffer
-containing exactly one complete shared frame. The bridge splits aggregated HTTP
-downlink batches at validated frame boundaries before crossing the WebView IPC
-boundary. Messages from the app to the bridge use the same two representations;
-the app should keep DATA frames at or below the relay's 64 KiB chunk size.
-
-The Android proof of concept points tgnet's existing MTProxy connection at a
-numeric loopback listener. Each accepted local TCP connection becomes one logical
-WEB stream, so bytes crossing this WebView boundary have already received the
-normal MTProxy transformation. The public relay remains unable to choose a client
-destination or decrypt the stream.
-
-### iOS compatibility
-
-An iOS proof of concept may reuse this boundary without a server protocol change.
-It loads the same `#android` fragment, exposes the same `TelegramWebProxy` page
-object, and accepts the same `tproxy-android-init` control string. Those names are
-retained as legacy v1 wire identifiers; they do not require an Android runtime.
-
-Because `WKScriptMessageHandler` does not expose Android's ArrayBuffer message API,
-an iOS-injected page shim may base64-encode one complete shared frame while crossing
-only the private JavaScript-to-native IPC boundary. The shim decodes it before
-presenting an ArrayBuffer to the bridge, and performs the inverse conversion for
-native-to-bridge traffic. This encoding is not part of the HTTP carrier or shared
-frame format. The native handler must still authenticate the main frame, exact
-HTTPS origin, active WebView, random nonce, and current navigation before accepting
-any message.
 
 ## HTTP carrier
 
@@ -116,6 +126,10 @@ X-Session-Token: session-token
 X-Down-Cursor: 0
 Body: one WELCOME frame
 ```
+
+After a valid bootstrap is authenticated, temporary session-capacity or
+creation-rate exhaustion returns `503 Service Unavailable` with `Retry-After: 1`.
+The bootstrap remains unconsumed so the byte-identical creation request can retry.
 
 Uplink requests are serialized. `X-Up-Seq` begins at `1`. The relay accepts the
 next sequence or a byte-identical retry of the last committed sequence:
@@ -172,8 +186,30 @@ type:u8 | stream_id:u24 | payload_length:u32 | payload
 | `0x11` | `WELCOME` | relay → client | zero | empty |
 | `0x1f` | `BYE` | relay → client | zero | optional bounded reason |
 
+## Client stream lifecycle
+
+The Telegram app, not the bridge JavaScript, prepares the shared frames:
+
+1. After the client boundary is authenticated, the client sends one
+   `HELLO`. It may create streams only after receiving `WELCOME`.
+2. Each MTProxy TCP connection opened by the app becomes a new, never-reused
+   nonzero stream id and one `OPEN` frame.
+3. Bytes already transformed for MTProxy become one or more `DATA` frames for that
+   id. The client sends only within the relay-granted window.
+4. Relay `DATA` is written to the corresponding local app connection. As the local
+   Telegram networking engine drains those bytes, the client returns that amount as
+   `WINDOW` credit.
+5. EOF or failure on either side produces `CLOSE` for that stream. Other streams
+   and the shared carrier continue.
+6. Replacing or disabling the WEB proxy closes the carrier session and all of its
+   logical streams.
+
+The bridge batches complete client frames into `/up` request bodies and delivers
+complete relay frames from `/down`; it never creates MTProxy payloads or assigns
+stream ids.
+
 The implementation does not emit PING or BYE in v1. A carrier failure closes the
-authenticated HTTP session and the bridge tells tdesktop to replace it.
+authenticated HTTP session and the bridge tells the client to replace it.
 
 The maximum payload is 1 MiB. Relay DATA chunks are at most 64 KiB. Each stream
 begins with 4 MiB of credit in each direction. Client DATA consumes relay receive
@@ -196,10 +232,16 @@ An `OPEN` creates exactly one connection to the profile's configured numeric
 loopback backend. The client cannot select a destination. Stream IDs cannot be
 reused during a session. Up to 4096 recently closed IDs remain as tombstones so
 well-formed late DATA, WINDOW, or CLOSE frames from a close race can be ignored.
+If an otherwise valid `OPEN` exceeds a per-session, profile, process-wide,
+dial-in-flight, or stream-creation-rate limit, the relay returns `CLOSE` for that
+stream id. It does not close the authenticated session or its other streams.
 
-## Compatibility sources
+## Implementation references
 
-- Desktop frame constants: `../tproxy/Telegram/SourceFiles/mtproto/web_proxy/web_proxy_frame.h`
-- Desktop browser parent: `../tproxy/Telegram/SourceFiles/mtproto/web_proxy/web_proxy_transport.cpp`
+- Telegram Desktop frame codec: `../tproxy/Telegram/SourceFiles/mtproto/web_proxy/web_proxy_frame.h`
+- Telegram Desktop carriers: `../tproxy/Telegram/SourceFiles/mtproto/web_proxy/web_proxy_webview.cpp`
+  and `../tproxy/Telegram/SourceFiles/mtproto/web_proxy/web_proxy_transport.cpp`
+- Android client notes: `ANDROID.md`
+- iOS client notes: `IOS.md`
 - Server codec: `internal/frame/frame.go`
 - Server carrier: `internal/server/server.go`

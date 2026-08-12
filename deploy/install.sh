@@ -4,9 +4,11 @@ set -euo pipefail
 hostname=
 secret=
 email=
+mtproxy_workers=1
+mtproxy_max_connections=4096
 
 usage() {
-	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--secret 32-or-34-hex]" >&2
+	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--secret 32-or-34-hex] [--mtproxy-workers 1] [--mtproxy-max-connections 4096]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -14,6 +16,8 @@ while [[ $# -gt 0 ]]; do
 		--hostname) hostname="${2:-}"; shift 2 ;;
 		--secret) secret="${2:-}"; shift 2 ;;
 		--email) email="${2:-}"; shift 2 ;;
+		--mtproxy-workers) mtproxy_workers="${2:-}"; shift 2 ;;
+		--mtproxy-max-connections) mtproxy_max_connections="${2:-}"; shift 2 ;;
 		*) usage; exit 2 ;;
 	esac
 done
@@ -40,6 +44,14 @@ if [[ ! "$secret" =~ ^([0-9a-f]{32}|dd[0-9a-f]{32})$ ]]; then
 fi
 if [[ ! "$email" =~ ^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
 	echo "a valid ACME contact email is required" >&2
+	exit 2
+fi
+if [[ ! "$mtproxy_workers" =~ ^[1-9][0-9]*$ ]] || ((mtproxy_workers > 256)); then
+	echo "mtproxy workers must be between 1 and 256" >&2
+	exit 2
+fi
+if [[ ! "$mtproxy_max_connections" =~ ^[1-9][0-9]*$ ]]; then
+	echo "mtproxy max connections must be positive" >&2
 	exit 2
 fi
 
@@ -136,6 +148,8 @@ if [[ "$backend_secret" == dd* ]] && [[ ${#backend_secret} -eq 34 ]]; then
 fi
 cat > /etc/mtproxy/mtproxy.env <<EOF
 MTPROXY_SECRET=$backend_secret
+MTPROXY_WORKERS=$mtproxy_workers
+MTPROXY_MAX_CONNECTIONS=$mtproxy_max_connections
 EOF
 chown root:mtproxy /etc/mtproxy/mtproxy.env
 chmod 0640 /etc/mtproxy/mtproxy.env

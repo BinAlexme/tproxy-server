@@ -196,6 +196,70 @@ func TestUplinkBackpressureIsRetryable(t *testing.T) {
 	}
 }
 
+func TestSessionCapacityOverloadIsRetryable(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Limits.MaxSessionsGlobal = 1
+		value.Limits.NewSessionsBurst = 10
+		value.Limits.NewSessionsPerMinute = 600
+	})
+	defer application.Shutdown()
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	clientIP := "198.51.100.7"
+	firstBootstrap, err := application.manager.IssueBootstrap(
+		&application.config.Profiles[0],
+		clientIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := application.manager.Create(
+		firstBootstrap,
+		clientIP,
+		frame.Encode(frame.Hello, 0, []byte{1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBootstrap, err := application.manager.IssueBootstrap(
+		&application.config.Profiles[0],
+		clientIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hello := frame.Encode(frame.Hello, 0, []byte{1})
+	overloaded := perform(t, hosted.Client(), apiRequest(
+		t,
+		http.MethodPost,
+		hosted.URL+"/api/v1/session",
+		secondBootstrap,
+		hello))
+	_ = readResponse(t, overloaded)
+	if overloaded.StatusCode != http.StatusServiceUnavailable ||
+		overloaded.Header.Get("Retry-After") != "1" ||
+		overloaded.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("session overload response was not retryable: status=%d", overloaded.StatusCode)
+	}
+	first.Session.Close()
+	deadline := time.Now().Add(time.Second)
+	for application.manager.Capacity().Sessions != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("closed session did not release capacity")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	retried := perform(t, hosted.Client(), apiRequest(
+		t,
+		http.MethodPost,
+		hosted.URL+"/api/v1/session",
+		secondBootstrap,
+		hello))
+	_ = readResponse(t, retried)
+	if retried.StatusCode != http.StatusOK {
+		t.Fatalf("session overload consumed the bootstrap: status=%d", retried.StatusCode)
+	}
+}
+
 func TestAdminSurfaceIsSeparate(t *testing.T) {
 	backend := startEchoBackend(t)
 	application, _ := newTestServer(t, backend)
@@ -218,6 +282,22 @@ func TestAdminSurfaceIsSeparate(t *testing.T) {
 	application.Handler().ServeHTTP(public, request)
 	if public.Code != http.StatusNotFound {
 		t.Fatal("profiling endpoint was available from the public handler")
+	}
+	metrics := httptest.NewRecorder()
+	application.AdminHandler().ServeHTTP(metrics, httptest.NewRequest(
+		http.MethodGet,
+		"http://127.0.0.1/metrics",
+		nil))
+	for _, name := range []string{
+		"tproxy_streams_live",
+		"tproxy_backend_dials_in_flight",
+		"tproxy_pending_bytes",
+		"tproxy_streams_rejected_total",
+		"tproxy_backend_dial_failures_total",
+	} {
+		if !strings.Contains(metrics.Body.String(), name+" ") {
+			t.Fatalf("metrics output omitted %s", name)
+		}
 	}
 }
 

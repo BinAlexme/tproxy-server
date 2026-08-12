@@ -186,6 +186,12 @@ func (s *Server) serveSession(w http.ResponseWriter, r *http.Request, token, cli
 	}
 	result, err := s.manager.Create(token, clientIP, body)
 	if err != nil {
+		if errors.Is(err, session.ErrLimit) {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		s.serveNotFound(w)
 		return
 	}
@@ -386,17 +392,28 @@ func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metrics := s.manager.Metrics()
+	capacity := s.manager.Capacity()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	_, _ = fmt.Fprintf(w,
 		"tproxy_sessions_live %d\n"+
+			"tproxy_streams_live %d\n"+
+			"tproxy_backend_dials_in_flight %d\n"+
+			"tproxy_pending_bytes %d\n"+
+			"tproxy_pending_items %d\n"+
 			"tproxy_sessions_created_total %d\n"+
 			"tproxy_sessions_closed_total %d\n"+
 			"tproxy_streams_opened_total %d\n"+
+			"tproxy_streams_rejected_total %d\n"+
+			"tproxy_backend_dial_failures_total %d\n"+
 			"tproxy_bytes_up_total %d\n"+
 			"tproxy_bytes_down_total %d\n"+
 			"tproxy_limit_hits_total %d\n",
-		s.manager.LiveSessions(), metrics.SessionsCreated, metrics.SessionsClosed,
-		metrics.StreamsOpened, metrics.BytesUp, metrics.BytesDown, metrics.LimitHits)
+		capacity.Sessions, capacity.Streams, capacity.BackendDialsInFlight,
+		capacity.PendingBytes, capacity.PendingItems,
+		metrics.SessionsCreated, metrics.SessionsClosed,
+		metrics.StreamsOpened, metrics.StreamsRejected,
+		metrics.BackendDialFailures, metrics.BytesUp, metrics.BytesDown,
+		metrics.LimitHits)
 }
 
 func readBody(w http.ResponseWriter, r *http.Request, limit int) ([]byte, error) {

@@ -31,15 +31,18 @@ const (
 )
 
 type sessionOptions struct {
-	profile    *config.Profile
-	clientIP   string
-	limits     config.Limits
-	timeouts   config.Timeouts
-	budget     func(int, int, pendingClass) bool
-	onFinished func(*Session)
-	onStream   func()
-	onUp       func(int)
-	onDown     func(int)
+	profile               *config.Profile
+	clientIP              string
+	limits                config.Limits
+	timeouts              config.Timeouts
+	budget                func(int, int, pendingClass) bool
+	onFinished            func(*Session)
+	acquireStream         func() bool
+	onBackendDialFinished func(bool)
+	onStreamFinished      func()
+	onStreamRejected      func()
+	onUp                  func(int)
+	onDown                func(int)
 }
 
 type streamState struct {
@@ -79,55 +82,61 @@ type Session struct {
 	timeouts config.Timeouts
 	budget   func(int, int, pendingClass) bool
 
-	mu             sync.Mutex
-	streams        map[uint32]*streamState
-	closedStreams  map[uint32]struct{}
-	closedOrder    []uint32
-	closedStart    int
-	pendingFrames  []queuedFrame
-	pendingWindows map[uint32]int
-	pendingCost    int
-	pendingItems   int
-	unacked        []byte
-	unackedCost    int
-	unackedItems   int
-	unackedBase    uint64
-	downCursor     uint64
-	lastUpSequence uint64
-	lastUpDigest   [sha256.Size]byte
-	upActive       bool
-	downActive     bool
-	closed         bool
-	lastActivity   time.Time
-	notify         chan struct{}
-	budgetNotify   chan struct{}
-	done           chan struct{}
-	finishOnce     sync.Once
-	backendWG      sync.WaitGroup
-	onFinished     func(*Session)
-	onStream       func()
-	onUp           func(int)
-	onDown         func(int)
+	mu                    sync.Mutex
+	streams               map[uint32]*streamState
+	closedStreams         map[uint32]struct{}
+	closedOrder           []uint32
+	closedStart           int
+	pendingFrames         []queuedFrame
+	pendingWindows        map[uint32]int
+	pendingCost           int
+	pendingItems          int
+	unacked               []byte
+	unackedCost           int
+	unackedItems          int
+	unackedBase           uint64
+	downCursor            uint64
+	lastUpSequence        uint64
+	lastUpDigest          [sha256.Size]byte
+	upActive              bool
+	downActive            bool
+	closed                bool
+	lastActivity          time.Time
+	notify                chan struct{}
+	budgetNotify          chan struct{}
+	done                  chan struct{}
+	finishOnce            sync.Once
+	backendWG             sync.WaitGroup
+	onFinished            func(*Session)
+	acquireStream         func() bool
+	onBackendDialFinished func(bool)
+	onStreamFinished      func()
+	onStreamRejected      func()
+	onUp                  func(int)
+	onDown                func(int)
 }
 
 func newSession(options sessionOptions) *Session {
 	return &Session{
-		profile:        options.profile,
-		clientIP:       options.clientIP,
-		limits:         options.limits,
-		timeouts:       options.timeouts,
-		budget:         options.budget,
-		streams:        make(map[uint32]*streamState),
-		closedStreams:  make(map[uint32]struct{}),
-		pendingWindows: make(map[uint32]int),
-		lastActivity:   time.Now(),
-		notify:         make(chan struct{}, 1),
-		budgetNotify:   make(chan struct{}),
-		done:           make(chan struct{}),
-		onFinished:     options.onFinished,
-		onStream:       options.onStream,
-		onUp:           options.onUp,
-		onDown:         options.onDown,
+		profile:               options.profile,
+		clientIP:              options.clientIP,
+		limits:                options.limits,
+		timeouts:              options.timeouts,
+		budget:                options.budget,
+		streams:               make(map[uint32]*streamState),
+		closedStreams:         make(map[uint32]struct{}),
+		pendingWindows:        make(map[uint32]int),
+		lastActivity:          time.Now(),
+		notify:                make(chan struct{}, 1),
+		budgetNotify:          make(chan struct{}),
+		done:                  make(chan struct{}),
+		onFinished:            options.onFinished,
+		acquireStream:         options.acquireStream,
+		onBackendDialFinished: options.onBackendDialFinished,
+		onStreamFinished:      options.onStreamFinished,
+		onStreamRejected:      options.onStreamRejected,
+		onUp:                  options.onUp,
+		onDown:                options.onDown,
 	}
 }
 
@@ -187,7 +196,7 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 		s.mu.Unlock()
 		return 0, ErrBackpressure
 	}
-	opened, closed, unusedCost, unusedItems := s.applyBatchLocked(
+	opened, closed, unusedCost, unusedItems, applied := s.applyBatchLocked(
 		frames,
 		reservedCost,
 		reservedItems)
@@ -195,8 +204,10 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 		s.releasePendingLocked(unusedCost, unusedItems)
 	}
 	s.backendWG.Add(len(opened))
-	s.lastUpSequence = sequence
-	s.lastUpDigest = digest
+	if applied {
+		s.lastUpSequence = sequence
+		s.lastUpDigest = digest
+	}
 	s.mu.Unlock()
 
 	for _, value := range closed {
@@ -204,6 +215,10 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 	}
 	for _, value := range opened {
 		go s.runBackend(value)
+	}
+	if !applied {
+		s.Close()
+		return 0, ErrClosed
 	}
 	if s.onUp != nil {
 		s.onUp(len(body))
@@ -328,7 +343,7 @@ func (s *Session) validateBatchLocked(values []frame.Frame) bool {
 		wasClosed := wasClosedBefore || closedInBatch
 		switch value.Type {
 		case frame.Open:
-			if exists || wasClosed || len(live) >= s.limits.MaxStreamsPerSession {
+			if exists || wasClosed {
 				return false
 			}
 			live[value.StreamID] = streamSnapshot{
@@ -407,7 +422,8 @@ func (s *Session) applyBatchLocked(
 	[]*backendStream,
 	[]*backendStream,
 	int,
-	int) {
+	int,
+	bool) {
 	opened := make([]*backendStream, 0)
 	closed := make([]*backendStream, 0)
 	for _, value := range values {
@@ -418,6 +434,17 @@ func (s *Session) applyBatchLocked(
 		_, wasClosed := s.closedStreams[value.StreamID]
 		switch value.Type {
 		case frame.Open:
+			if len(s.streams) >= s.limits.MaxStreamsPerSession ||
+				(s.acquireStream != nil && !s.acquireStream()) {
+				s.rememberClosedLocked(value.StreamID)
+				if s.onStreamRejected != nil {
+					s.onStreamRejected()
+				}
+				if !s.queueFrameLocked(frame.Close, value.StreamID, nil) {
+					return opened, closed, reservedCost, reservedItems, false
+				}
+				continue
+			}
 			backend := newBackendStream(s, value.StreamID, s.profile.Backend)
 			state = &streamState{
 				backend:       backend,
@@ -428,9 +455,6 @@ func (s *Session) applyBatchLocked(
 			}
 			s.streams[value.StreamID] = state
 			opened = append(opened, backend)
-			if s.onStream != nil {
-				s.onStream()
-			}
 		case frame.Data:
 			if wasClosed {
 				continue
@@ -460,7 +484,7 @@ func (s *Session) applyBatchLocked(
 			closed = append(closed, state.backend)
 		}
 	}
-	return opened, closed, reservedCost, reservedItems
+	return opened, closed, reservedCost, reservedItems, true
 }
 
 func (s *Session) appendBackendWriteLocked(
@@ -873,7 +897,16 @@ func (s *Session) closeLocked() {
 
 func (s *Session) runBackend(value *backendStream) {
 	defer s.backendWG.Done()
+	if s.onStreamFinished != nil {
+		defer s.onStreamFinished()
+	}
 	value.run()
+}
+
+func (s *Session) backendDialFinished(failed bool) {
+	if s.onBackendDialFinished != nil {
+		s.onBackendDialFinished(failed)
+	}
 }
 
 func signal(channel chan struct{}) {
@@ -913,6 +946,7 @@ func (s *backendStream) run() {
 
 	dialer := net.Dialer{Timeout: s.session.timeouts.BackendDial.Value()}
 	connection, err := dialer.DialContext(s.ctx, "tcp", s.address)
+	s.session.backendDialFinished(err != nil && s.ctx.Err() == nil)
 	if err != nil {
 		return
 	}
