@@ -108,9 +108,65 @@ batches. Control objects are `{t:'status',state}`, diagnostic
 nonnegative numbers describing the completed carrier operation; clients may
 discard them after validation.
 
+### Hardened WebView execution profile
+
+The reference bridge is deliberately compatible with a private WebView that grants
+the remote document only JavaScript execution and exact-origin network access. It
+uses Fetch, `AbortController`, timers, same-document history replacement, typed
+arrays, and one authenticated native or `MessagePort` boundary. Its HTTPS requests
+use `mode: 'same-origin'`, `credentials: 'omit'`, `cache: 'no-store'`,
+`redirect: 'error'`, and `referrerPolicy: 'no-referrer'`.
+
+The bridge has no external scripts, styles, fonts, images, frames, objects, media,
+or manifests. It does not use cookies, DOM storage, IndexedDB, Cache Storage,
+service workers, dedicated/shared workers, popups, downloads, forms, WebRTC, device
+permissions, clipboard access, or cross-origin requests. A client may therefore
+disable those facilities without changing the carrier protocol. It must still
+allow the nonce-bearing inline script, exact-origin HTTPS requests, ordinary
+timers, and the selected authenticated client boundary.
+
+The reference response enforces the same profile with this CSP:
+
+```text
+default-src 'none';
+base-uri 'none';
+child-src 'none';
+connect-src 'self';
+font-src 'none';
+form-action 'none';
+frame-ancestors http://127.0.0.1:*;
+frame-src 'none';
+img-src 'none';
+manifest-src 'none';
+media-src 'none';
+object-src 'none';
+script-src 'nonce-<per-response nonce>';
+style-src 'none';
+worker-src 'none';
+sandbox allow-same-origin allow-scripts
+```
+
+`allow-scripts` is required because the carrier is implemented by the page script.
+`allow-same-origin` is required so Fetch sends the exact `https://H` origin instead
+of an opaque `null` origin. The numeric-loopback `frame-ancestors` source preserves
+the optional browser carrier without allowing arbitrary sites to frame the bridge.
+
+The response also sends `Cache-Control: no-store`, `Referrer-Policy: no-referrer`,
+`X-Content-Type-Options: nosniff`, `X-DNS-Prefetch-Control: off`, and a
+`Permissions-Policy` that denies autoplay, capture devices, sensors, clipboard,
+display capture, payment, wake lock, USB/HID/serial, and the other browser features
+unused by the bridge. It deliberately does not send `X-Frame-Options`, COOP, or
+COEP because those can prevent the loopback parent boundary from working.
+
+These response headers describe and protect the reference implementation. A
+hardened Telegram carrier must independently impose its own navigation, request,
+storage, media, and permission restrictions because a different proxy operator
+controls its own document and response headers.
+
 ## HTTP carrier
 
-All API requests have `Origin: https://H`, no cookies, and a bearer token. Binary
+All API requests have `Origin: https://H`, no cookies, and a bearer token. The
+reference relay rejects a cookie-bearing API request. Binary
 bodies use exactly `Content-Type: application/octet-stream`.
 
 Session creation exchanges a two-minute bootstrap token atomically and

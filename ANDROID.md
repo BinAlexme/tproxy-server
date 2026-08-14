@@ -80,7 +80,11 @@ path.
 
 No configuration, deployment, or Caddy change is required. A server must be updated
 to a build containing the Android bridge-page extension before the Android client
-can connect.
+can connect. The current bridge response also declares the hardened execution
+profile from `PROTOCOL.md`: all subresources, workers, media, frames, and the
+enumerated unused browser permissions are denied, and the page has no storage
+dependency. Inline nonce script execution, same-origin Fetch, and the authenticated
+WebMessage boundary remain available.
 
 ## Android source changes
 

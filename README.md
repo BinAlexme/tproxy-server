@@ -321,6 +321,15 @@ Do not apply your public site's
 bridge supplies a distinct CSP permitting only the numeric loopback parent.
 Do not enable access logging of raw URIs, authorization headers, or bodies.
 
+The generated bridge is self-contained and compatible with hardened native
+WebViews: it requires only its nonce-bearing inline script, exact-origin HTTPS
+Fetch, timers, typed arrays, and the authenticated app boundary. It does not use
+cookies or browser storage, external resources, workers, frames, media, popups,
+downloads, forms, device permissions, clipboard APIs, or cross-origin requests.
+Keep the bridge response headers produced by the Go relay intact; `PROTOCOL.md`
+lists the complete execution policy and explains which restrictions clients must
+also enforce independently.
+
 ## Multiple secrets on one hostname
 
 Add profiles to `/etc/tproxy-server/profiles.json`. Every profile has a unique name,

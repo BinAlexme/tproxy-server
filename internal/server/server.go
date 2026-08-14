@@ -128,14 +128,17 @@ func (s *Server) serveRoot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+	w.Header().Set("X-DNS-Prefetch-Control", "off")
+	w.Header().Set("Permissions-Policy", bridge.PermissionsPolicy)
 	w.Header().Set("Content-Length", strconv.Itoa(len(page.Body)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(page.Body)
 }
 
 func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
-	if r.URL.RawQuery != "" || r.Header.Get("Origin") != "https://"+s.config.PublicHostname {
+	if r.URL.RawQuery != "" ||
+		r.Header.Get("Origin") != "https://"+s.config.PublicHostname ||
+		r.Header.Get("Cookie") != "" {
 		s.serveNotFound(w)
 		return
 	}

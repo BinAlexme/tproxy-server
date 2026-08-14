@@ -228,20 +228,37 @@ The bridge-specific response must override public-site framing policy:
 ```text
 Content-Security-Policy:
   default-src 'none';
-  script-src 'nonce-<per-response nonce>';
-  connect-src 'self';
-  frame-ancestors http://127.0.0.1:*;
   base-uri 'none';
-  form-action 'none'
+  child-src 'none';
+  connect-src 'self';
+  font-src 'none';
+  form-action 'none';
+  frame-ancestors http://127.0.0.1:*;
+  frame-src 'none';
+  img-src 'none';
+  manifest-src 'none';
+  media-src 'none';
+  object-src 'none';
+  script-src 'nonce-<per-response nonce>';
+  style-src 'none';
+  worker-src 'none';
+  sandbox allow-same-origin allow-scripts
 Cache-Control: no-store
 Referrer-Policy: no-referrer
 X-Content-Type-Options: nosniff
-Permissions-Policy: camera=(), microphone=(), geolocation=()
+X-DNS-Prefetch-Control: off
+Permissions-Policy: deny the enumerated browser capabilities unused by the bridge
 ```
 
 Do not send `X-Frame-Options`, COOP, COEP, or another header that prevents the
 loopback page from embedding the bridge. The public site may use stricter framing
 headers because it is a different response.
+
+The page must remain functional with cookies, DOM storage, IndexedDB, Cache
+Storage, workers, service workers, frames, media, downloads, popups, forms, device
+permissions, clipboard access, and cross-origin requests disabled. It uses only
+the nonce-bearing inline script, exact-origin Fetch, timers, typed arrays,
+same-document history replacement, and its authenticated client boundary.
 
 Do not put a CDN in front of v1. Long polls, in-memory session affinity, request
 buffering, provider terms, and CDN behavior are separate design work. DNS should

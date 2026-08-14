@@ -15,6 +15,8 @@ type Page struct {
 	CSP   string
 }
 
+const PermissionsPolicy = "accelerometer=(), autoplay=(), camera=(), clipboard-read=(), clipboard-write=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), hid=(), idle-detection=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-create=(), publickey-credentials-get=(), screen-wake-lock=(), serial=(), usb=(), web-share=(), xr-spatial-tracking=()"
+
 func Render(hostname, bootstrapToken string, batchBytes int) (Page, error) {
 	if batchBytes <= 0 {
 		return Page{}, errors.New("carrier batch size must be positive")
@@ -36,7 +38,24 @@ func Render(hostname, bootstrapToken string, batchBytes int) (Page, error) {
 	return Page{
 		Body:  []byte(body),
 		Nonce: nonce,
-		CSP:   "default-src 'none'; script-src 'nonce-" + nonce + "'; connect-src 'self'; frame-ancestors http://127.0.0.1:*; base-uri 'none'; form-action 'none'",
+		CSP: strings.Join([]string{
+			"default-src 'none'",
+			"base-uri 'none'",
+			"child-src 'none'",
+			"connect-src 'self'",
+			"font-src 'none'",
+			"form-action 'none'",
+			"frame-ancestors http://127.0.0.1:*",
+			"frame-src 'none'",
+			"img-src 'none'",
+			"manifest-src 'none'",
+			"media-src 'none'",
+			"object-src 'none'",
+			"script-src 'nonce-" + nonce + "'",
+			"style-src 'none'",
+			"worker-src 'none'",
+			"sandbox allow-same-origin allow-scripts",
+		}, "; "),
 	}, nil
 }
 
@@ -60,7 +79,7 @@ const pending=[],upPending=[],queueLimit=33554432,queueItemLimit=16384,batchLimi
 const status=state=>{if(port&&!closed)port.postMessage({t:'status',state})};
 const pause=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
 const options=(method,token,body,headers,signal,keepalive)=>({
- method,body,signal,keepalive:!!keepalive,credentials:'omit',cache:'no-store',redirect:'error',referrerPolicy:'no-referrer',
+ method,body,signal,keepalive:!!keepalive,mode:'same-origin',credentials:'omit',cache:'no-store',redirect:'error',referrerPolicy:'no-referrer',
  headers:Object.assign(token?{Authorization:'Bearer '+token}:{},body?{'Content-Type':'application/octet-stream'}:{},headers||{})
 });
 async function request(path,makeOptions){
@@ -72,7 +91,7 @@ async function request(path,makeOptions){
   requestOptions.signal=controller.signal;
   const timer=setTimeout(abort,90000);
   try{
-   const response=await fetch(path,requestOptions);
+   const response=await fetch(relayOrigin+path,requestOptions);
    if(response.status<500)return response;
    await response.arrayBuffer();
   }catch(error){if(closed||(external&&external.aborted))throw error}
@@ -157,7 +176,7 @@ function close(notifyServer){
  closed=true;
  if(pollController)pollController.abort();
  if(notifyServer&&sessionToken){
-  fetch('/api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});
+  fetch(relayOrigin+'/api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});
  }
  if(port)port.close();
 }

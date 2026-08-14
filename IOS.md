@@ -41,9 +41,10 @@ protocol limits and per-stream flow control in `PROTOCOL.md`.
 
 ## Reusing the current server bridge
 
-No server code, Caddy configuration, relay endpoint, or deployment change is
-required for the iOS proof of concept. The iOS client can intentionally emulate
-the existing Android WebView boundary:
+No Caddy configuration, relay endpoint, or wire-protocol change is required for
+the iOS proof of concept. Deploy the current server build so its bridge response
+declares the hardened execution profile from `PROTOCOL.md`. The iOS client can
+intentionally emulate the existing Android WebView boundary:
 
 1. derive the same bridge capability and load the existing
    `#android=<43-character nonce>` URL;
@@ -62,6 +63,12 @@ WebKit's script-message boundary is not the public relay protocol. The injected
 shim may base64-encode a complete binary frame inside its private JSON envelope;
 the remote bridge still observes the same ArrayBuffer-or-control-string contract,
 and the HTTP carrier and frame bytes do not change.
+
+The reference page remains functional when the `WKWebView` uses a nonpersistent
+data store and the app blocks storage, subframes, media, popups, downloads,
+permissions, and navigation away from the configured origin. The page still needs
+its nonce-bearing inline script, exact-origin Fetch, timers, typed arrays,
+same-document history replacement, and the authenticated script-message boundary.
 
 ## WKWebView boundary
 

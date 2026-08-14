@@ -53,8 +53,31 @@ func TestPublicFallbackAndCarrierRoundTrip(t *testing.T) {
 	if bytes.Contains(bridgeBody, []byte(hex.EncodeToString(secret))) || bridgeResponse.Header.Get("Cache-Control") != "no-store" {
 		t.Fatal("bridge response contained the profile secret or allowed caching")
 	}
-	if !strings.Contains(bridgeResponse.Header.Get("Content-Security-Policy"), "frame-ancestors http://127.0.0.1:*") {
-		t.Fatal("bridge is missing its loopback framing policy")
+	csp := bridgeResponse.Header.Get("Content-Security-Policy")
+	for _, directive := range []string{
+		"frame-ancestors http://127.0.0.1:*",
+		"worker-src 'none'",
+		"media-src 'none'",
+		"sandbox allow-same-origin allow-scripts",
+	} {
+		if !strings.Contains(csp, directive) {
+			t.Fatalf("bridge is missing CSP directive %q", directive)
+		}
+	}
+	if bridgeResponse.Header.Get("X-DNS-Prefetch-Control") != "off" ||
+		!strings.Contains(bridgeResponse.Header.Get("Permissions-Policy"), "autoplay=()") ||
+		!strings.Contains(bridgeResponse.Header.Get("Permissions-Policy"), "clipboard-read=()") {
+		t.Fatal("bridge is missing hardened browser capability headers")
+	}
+	for _, header := range []string{
+		"Cross-Origin-Embedder-Policy",
+		"Cross-Origin-Opener-Policy",
+		"Set-Cookie",
+		"X-Frame-Options",
+	} {
+		if bridgeResponse.Header.Get(header) != "" {
+			t.Fatalf("bridge response must not send %s", header)
+		}
 	}
 	match := regexp.MustCompile(`bootstrap="([A-Za-z0-9_-]{43})"`).FindSubmatch(bridgeBody)
 	if len(match) != 2 {
@@ -63,6 +86,13 @@ func TestPublicFallbackAndCarrierRoundTrip(t *testing.T) {
 	bootstrap := string(match[1])
 
 	hello := frame.Encode(frame.Hello, 0, []byte{1})
+	withCookie := apiRequest(t, http.MethodPost, hosted.URL+"/api/v1/session", bootstrap, hello)
+	withCookie.Header.Set("Cookie", "unexpected=value")
+	cookieResponse := perform(t, hosted.Client(), withCookie)
+	_ = readResponse(t, cookieResponse)
+	if cookieResponse.StatusCode != http.StatusNotFound {
+		t.Fatal("carrier API accepted a cookie-bearing request")
+	}
 	created := perform(t, hosted.Client(), apiRequest(t, http.MethodPost, hosted.URL+"/api/v1/session", bootstrap, hello))
 	welcome := readResponse(t, created)
 	if created.StatusCode != http.StatusOK || !bytes.Equal(welcome, frame.Encode(frame.Welcome, 0, nil)) {
