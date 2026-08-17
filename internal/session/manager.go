@@ -101,6 +101,7 @@ type Manager struct {
 
 func NewManager(value config.Config) *Manager {
 	for i := range value.Profiles {
+		value.Profiles[i].CarrierMode = value.Profiles[i].CarrierMode.WithDefault()
 		value.Profiles[i].Limits = value.Profiles[i].Limits.WithDefaults(value.Limits)
 	}
 	result := &Manager{

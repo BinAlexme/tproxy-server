@@ -39,6 +39,114 @@ func TestSequenceRetryAndMismatch(t *testing.T) {
 	}
 }
 
+func TestLaneSequencesAndReplayAreIndependent(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierHTTPSLanes
+	manager := NewManager(configuration)
+	defer manager.Shutdown()
+	bootstrap, err := manager.IssueBootstrap(
+		&configuration.Profiles[0],
+		"198.51.100.9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := manager.Create(
+		bootstrap,
+		"198.51.100.9",
+		frame.Encode(frame.Hello, 0, []byte{1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := frame.Encode(frame.Open, 51, nil)
+	second := frame.Encode(frame.Open, 52, nil)
+	if ack, err := created.Session.ProcessUpLane(51, 1, first); err != nil || ack != 1 {
+		t.Fatalf("first lane failed: ack=%d error=%v", ack, err)
+	}
+	if ack, err := created.Session.ProcessUpLane(52, 1, second); err != nil || ack != 1 {
+		t.Fatalf("second lane did not have an independent sequence: ack=%d error=%v", ack, err)
+	}
+	if ack, err := created.Session.ProcessUpLane(51, 1, append([]byte(nil), first...)); err != nil || ack != 1 {
+		t.Fatalf("lane retry failed: ack=%d error=%v", ack, err)
+	}
+}
+
+func TestLaneRejectsCrossStreamFrames(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierHTTPSLanes
+	manager := NewManager(configuration)
+	defer manager.Shutdown()
+	bootstrap, err := manager.IssueBootstrap(
+		&configuration.Profiles[0],
+		"198.51.100.9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := manager.Create(
+		bootstrap,
+		"198.51.100.9",
+		frame.Encode(frame.Hello, 0, []byte{1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := append(frame.Encode(frame.Open, 61, nil), frame.Encode(frame.Open, 62, nil)...)
+	if _, err := created.Session.ProcessUpLane(61, 1, body); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("cross-stream lane body was accepted: %v", err)
+	}
+}
+
+func TestClosedLaneReplaysDownlinkAndFinalUplink(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierHTTPSLanes
+	manager := NewManager(configuration)
+	defer manager.Shutdown()
+	bootstrap, err := manager.IssueBootstrap(
+		&configuration.Profiles[0],
+		"198.51.100.9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := manager.Create(
+		bootstrap,
+		"198.51.100.9",
+		frame.Encode(frame.Hello, 0, []byte{1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	laneID := uint32(71)
+	opened := frame.Encode(frame.Open, laneID, nil)
+	if _, err := created.Session.ProcessUpLane(laneID, 1, opened); err != nil {
+		t.Fatal(err)
+	}
+	body, cursor, closed, err := created.Session.PollLane(
+		context.Background(),
+		laneID,
+		0)
+	if err != nil || closed || cursor != 1 {
+		t.Fatalf("failed to receive lane close: cursor=%d closed=%v error=%v", cursor, closed, err)
+	}
+	frames, err := frame.ParseAll(body, frame.MaxPayload)
+	if err != nil || len(frames) != 1 || frames[0].Type != frame.Close {
+		t.Fatalf("unexpected lane close body: frames=%v error=%v", frames, err)
+	}
+	replayed, replayCursor, closed, err := created.Session.PollLane(
+		context.Background(),
+		laneID,
+		0)
+	if err != nil || closed || replayCursor != cursor || !bytes.Equal(replayed, body) {
+		t.Fatal("lost lane downlink was not replayed byte-for-byte")
+	}
+	empty, finalCursor, closed, err := created.Session.PollLane(
+		context.Background(),
+		laneID,
+		cursor)
+	if err != nil || !closed || len(empty) != 0 || finalCursor != cursor {
+		t.Fatalf("closed lane did not acknowledge its final cursor: cursor=%d closed=%v error=%v", finalCursor, closed, err)
+	}
+	if ack, err := created.Session.ProcessUpLane(laneID, 1, opened); err != nil || ack != 1 {
+		t.Fatalf("closed lane could not replay its final uplink: ack=%d error=%v", ack, err)
+	}
+}
+
 func TestRejectsStreamReuseAndWindowOverrun(t *testing.T) {
 	manager, _, value := testSession(t)
 	defer manager.Shutdown()

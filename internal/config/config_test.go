@@ -78,7 +78,7 @@ func TestLoadAppliesDefaultsAndRelativePaths(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(public, "index.html"), []byte("site"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	profiles := `{"profiles":[{"name":"default","secret":"000102030405060708090a0b0c0d0e0f","backend":"127.0.0.1:2398"}]}`
+	profiles := `{"profiles":[{"name":"default","secret":"000102030405060708090a0b0c0d0e0f","backend":"127.0.0.1:2398","carrier_mode":"https-lanes"}]}`
 	if err := os.WriteFile(filepath.Join(directory, "profiles.json"), []byte(profiles), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestLoadAppliesDefaultsAndRelativePaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.PublicDir != public || len(loaded.Profiles) != 1 || loaded.Limits.MaxBodyBytes != 2*1024*1024 {
+	if loaded.PublicDir != public || len(loaded.Profiles) != 1 || loaded.Limits.MaxBodyBytes != 2*1024*1024 || loaded.Profiles[0].CarrierMode != CarrierHTTPSLanes {
 		t.Fatalf("unexpected loaded configuration: %#v", loaded)
 	}
 	profileLimits := loaded.Profiles[0].Limits
@@ -101,6 +101,38 @@ func TestLoadAppliesDefaultsAndRelativePaths(t *testing.T) {
 		profileLimits.NewSessionsPerMinute != loaded.Limits.NewSessionsPerMinute ||
 		profileLimits.NewStreamsPerMinute != loaded.Limits.NewStreamsPerMinute {
 		t.Fatalf("profile limits did not inherit global values: %#v", profileLimits)
+	}
+}
+
+func TestProfileCarrierModeDefaultsAndValidation(t *testing.T) {
+	directory := t.TempDir()
+	public := filepath.Join(directory, "public")
+	if err := os.Mkdir(public, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(public, "index.html"), []byte("site"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	profilesPath := filepath.Join(directory, "profiles.json")
+	writeProfiles := func(carrier string) {
+		value := `{"profiles":[{"name":"default","secret":"000102030405060708090a0b0c0d0e0f","backend":"127.0.0.1:2398"` + carrier + `}]}`
+		if err := os.WriteFile(profilesPath, []byte(value), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := `{"public_hostname":"proxy.example.com","public_dir":"public","profiles_file":"profiles.json"}`
+	configPath := filepath.Join(directory, "config.json")
+	if err := os.WriteFile(configPath, []byte(server), 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeProfiles("")
+	loaded, err := Load(configPath)
+	if err != nil || loaded.Profiles[0].CarrierMode != CarrierHTTPS {
+		t.Fatalf("omitted carrier mode did not default to HTTPS: %#v %v", loaded.Profiles, err)
+	}
+	writeProfiles(`,"carrier_mode":"unknown"`)
+	if _, err := Load(configPath); err == nil {
+		t.Fatal("invalid carrier mode was accepted")
 	}
 }
 

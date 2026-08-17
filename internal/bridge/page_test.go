@@ -7,7 +7,7 @@ import (
 )
 
 func TestRenderUsesNonceAndConfiguredBatch(t *testing.T) {
-	page, err := Render("proxy.example.com", "bootstrap-token", 2*1024*1024)
+	page, err := Render("proxy.example.com", "bootstrap-token", "https", 2*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -15,7 +15,7 @@ func TestRenderUsesNonceAndConfiguredBatch(t *testing.T) {
 	if page.Nonce == "" || !strings.Contains(body, `script nonce="`+page.Nonce+`"`) || !strings.Contains(page.CSP, `script-src 'nonce-`+page.Nonce+`'`) {
 		t.Fatal("rendered bridge does not bind its script to the response nonce")
 	}
-	if !strings.Contains(body, "batchLimit=2097152") {
+	if !strings.Contains(body, "carrierMode=\"https\"") || !strings.Contains(body, "batchLimit=2097152") {
 		t.Fatal("rendered bridge omitted the configured carrier batch")
 	}
 	if !strings.Contains(body, "queueItemLimit=16384") || !strings.Contains(body, "setTimeout(abort,90000)") {
@@ -26,12 +26,12 @@ func TestRenderUsesNonceAndConfiguredBatch(t *testing.T) {
 		!strings.Contains(body, "cache:'no-store',redirect:'error',referrerPolicy:'no-referrer'") {
 		t.Fatal("rendered bridge omitted its same-origin request restrictions")
 	}
-	if !strings.Contains(body, "t:'traffic',up:total,down:0") || !strings.Contains(body, "t:'traffic',up:0,down:data.byteLength});\n   port.postMessage(data,[data])") {
+	if !strings.Contains(body, "t:'traffic',up:batch.total,down:0") || !strings.Contains(body, "t:'traffic',up:0,down:data.byteLength") {
 		t.Fatal("rendered bridge omitted acknowledged traffic counters")
 	}
 	if !strings.Contains(body, "t:'tproxy-android-init',v:1,nonce:androidNonce") ||
 		!strings.Contains(body, "globalThis.TelegramWebProxy") ||
-		!strings.Contains(body, "androidBridge.postMessage(value.slice(frame[0],frame[1]))") {
+		!strings.Contains(body, "androidBridge.postMessage(frame.data)") {
 		t.Fatal("rendered bridge omitted the origin-scoped Android transport")
 	}
 	for _, unwanted := range [][]byte{
@@ -59,7 +59,7 @@ func TestRenderUsesNonceAndConfiguredBatch(t *testing.T) {
 }
 
 func TestRenderUsesHardenedExecutionPolicy(t *testing.T) {
-	page, err := Render("proxy.example.com", "bootstrap-token", 2*1024*1024)
+	page, err := Render("proxy.example.com", "bootstrap-token", "https", 2*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestRenderUsesHardenedExecutionPolicy(t *testing.T) {
 		"default-src":     "'none'",
 		"base-uri":        "'none'",
 		"child-src":       "'none'",
-		"connect-src":     "'self'",
+		"connect-src":     "'self' wss://proxy.example.com",
 		"font-src":        "'none'",
 		"form-action":     "'none'",
 		"frame-ancestors": "http://127.0.0.1:*",
@@ -117,7 +117,33 @@ func TestRenderUsesHardenedExecutionPolicy(t *testing.T) {
 }
 
 func TestRenderRejectsInvalidBatch(t *testing.T) {
-	if _, err := Render("proxy.example.com", "bootstrap-token", 0); err == nil {
+	if _, err := Render("proxy.example.com", "bootstrap-token", "https", 0); err == nil {
 		t.Fatal("accepted a nonpositive carrier batch")
+	}
+	if _, err := Render("proxy.example.com", "bootstrap-token", "invalid", 2*1024*1024); err == nil {
+		t.Fatal("accepted an invalid carrier mode")
+	}
+}
+
+func TestRenderIncludesSelectableCarrierImplementations(t *testing.T) {
+	for _, mode := range []string{"https", "https-lanes", "websocket"} {
+		page, err := Render("proxy.example.com", "bootstrap-token", mode, 2*1024*1024)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := string(page.Body)
+		if !strings.Contains(body, `carrierMode="`+mode+`"`) {
+			t.Fatalf("rendered bridge omitted carrier mode %q", mode)
+		}
+		for _, implementation := range []string{
+			"async function runLaneUp(lane)",
+			"async function pollLane(lane)",
+			"function openWebSocket()",
+			"function runWebSocketUp()",
+		} {
+			if !strings.Contains(body, implementation) {
+				t.Fatalf("rendered %s bridge omitted %q", mode, implementation)
+			}
+		}
 	}
 }

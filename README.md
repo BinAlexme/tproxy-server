@@ -3,7 +3,8 @@
 `tproxy-server` is the hosted half of a proof-of-concept WEB proxy type for
 Telegram. A Telegram app keeps its normal MTProxy framing and encryption, but sends
 all of its proxy TCP connections through one app-owned WebView transport. The
-WebView carries a multiplexed session over ordinary same-origin HTTPS requests.
+WebView carries a multiplexed session over a server-selected same-origin HTTPS or
+WebSocket carrier.
 The relay separates the logical streams again and connects each one to a stock
 official MTProxy on the server.
 
@@ -12,7 +13,7 @@ app that can host a WebView and connect its MTProxy sockets to a small local ada
 can implement the client side. The current proof-of-concept work includes a
 Telegram Desktop implementation, an experimental Android client described in
 [`ANDROID.md`](ANDROID.md), and an iOS client plan in [`IOS.md`](IOS.md). All use
-the same bridge page, HTTP carrier, shared frame format, and server deployment.
+the same bridge page, carrier selection, shared frame format, and server deployment.
 
 The configured hostname remains a regular HTTPS website. A capability derived from
 the hostname and MTProxy secret selects a one-shot bridge page; every other normal
@@ -30,7 +31,7 @@ Telegram app
           |
           v
   one WebView transport and authenticated relay session
-  multiplexed frames in HTTPS POST requests
+  multiplexed frames in the selected HTTPS/WebSocket carrier
           |
           v
   tproxy-server -> one local TCP connection per stream -> official MTProxy
@@ -39,14 +40,15 @@ Telegram app
 The app configures only a hostname and an MTProxy secret. It derives the bridge
 capability locally and never exposes the raw secret to JavaScript. The WebView
 opens the bridge, exchanges a short-lived bootstrap token for a relay session, and
-runs one serialized uplink request queue beside one downlink long poll. `OPEN`,
-`DATA`, `WINDOW`, and `CLOSE` frames multiplex every app connection through that
-session. The relay treats DATA as opaque bytes: it cannot choose a Telegram
-destination or decrypt the MTProxy stream.
+runs the carrier mode selected by the matching server profile. `OPEN`, `DATA`,
+`WINDOW`, and `CLOSE` frames multiplex every app connection through that session.
+The relay treats DATA as opaque bytes: it cannot choose a Telegram destination or
+decrypt the MTProxy stream.
 
 “One WebView transport” means one logical carrier and relay session for the app,
-not one HTTP request. The bridge normally has an uplink POST and a downlink
-long-poll active concurrently and starts new requests as those operations complete.
+not one HTTP request or backend connection. The profile may use the original
+serialized HTTPS carrier, independent HTTPS request lanes per Telegram logical
+session, or one multiplexed WebSocket.
 
 See [`PROTOCOL.md`](PROTOCOL.md) for the normative wire contract and
 [`PLAN.md`](PLAN.md) for the architecture, limits, implementation rationale, and
@@ -323,7 +325,8 @@ Do not enable access logging of raw URIs, authorization headers, or bodies.
 
 The generated bridge is self-contained and compatible with hardened native
 WebViews: it requires only its nonce-bearing inline script, exact-origin HTTPS
-Fetch, timers, typed arrays, and the authenticated app boundary. It does not use
+Fetch and optionally same-origin WSS, timers, typed arrays, and the authenticated
+app boundary. It does not use
 cookies or browser storage, external resources, workers, frames, media, popups,
 downloads, forms, device permissions, clipboard APIs, or cross-origin requests.
 Keep the bridge response headers produced by the Go relay intact; `PROTOCOL.md`
@@ -341,12 +344,14 @@ client secret, and numeric loopback backend:
     {
       "name": "alpha",
       "secret": "0123456789abcdef0123456789abcdef",
-      "backend": "127.0.0.1:2398"
+      "backend": "127.0.0.1:2398",
+      "carrier_mode": "https"
     },
     {
       "name": "beta",
       "secret": "fedcba9876543210fedcba9876543210",
       "backend": "127.0.0.1:2399",
+      "carrier_mode": "https-lanes",
       "limits": {
         "max_sessions": 32,
         "max_streams": 512,
@@ -362,6 +367,18 @@ client secret, and numeric loopback backend:
   ]
 }
 ```
+
+`carrier_mode` is optional and defaults to `https` for compatibility:
+
+| Mode | Carrier behavior | Primary tradeoff |
+|---|---|---|
+| `https` | one serialized POST plus one long poll | conservative baseline; one direction is capped near `carrier_batch_bytes / RTT` |
+| `https-lanes` | independent POST sequence and long poll for every logical stream | mirrors Telegram TCP sessions and isolates latency; relies on HTTP/2 for many concurrent polls |
+| `websocket` | one ordered WebSocket multiplexing all streams | removes HTTP stop-and-wait with one connection; all streams share its TCP congestion and failure domain |
+
+The mode is selected through the secret/profile, so existing Desktop, Android, and
+iOS proof-of-concept clients need no new setting or client-side transport code. Use
+different secrets when exposing several modes on one hostname.
 
 Run one official MTProxy process and listener per profile when profiles need
 separate quotas or routing. Extend `firewall.nft` to include every added backend

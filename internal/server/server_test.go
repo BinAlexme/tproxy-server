@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"io"
 	"net"
@@ -11,10 +12,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/telegramdesktop/tproxy-server/internal/config"
 	"github.com/telegramdesktop/tproxy-server/internal/frame"
 )
@@ -290,6 +293,162 @@ func TestSessionCapacityOverloadIsRetryable(t *testing.T) {
 	}
 }
 
+func TestHTTPSLanesRoundTripIndependently(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierHTTPSLanes
+	})
+	defer application.Shutdown()
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	bootstrap, err := application.manager.IssueBootstrap(
+		&application.config.Profiles[0],
+		"198.51.100.7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := perform(t, hosted.Client(), apiRequest(
+		t,
+		http.MethodPost,
+		hosted.URL+"/api/v1/session",
+		bootstrap,
+		frame.Encode(frame.Hello, 0, []byte{1})))
+	_ = readResponse(t, created)
+	if created.StatusCode != http.StatusOK || created.Header.Get("X-Carrier-Mode") != string(config.CarrierHTTPSLanes) {
+		t.Fatalf("lane session creation failed: status=%d mode=%q", created.StatusCode, created.Header.Get("X-Carrier-Mode"))
+	}
+	token := created.Header.Get("X-Session-Token")
+	for _, test := range []struct {
+		id      uint32
+		payload string
+	}{{31, "first lane"}, {32, "second lane"}} {
+		body := append(frame.Encode(frame.Open, test.id, nil), frame.Encode(frame.Data, test.id, []byte(test.payload))...)
+		request := apiRequest(t, http.MethodPost, hosted.URL+"/api/v1/up", token, body)
+		request.Header.Set("X-Up-Seq", "1")
+		request.Header.Set("X-Lane-ID", strconv.FormatUint(uint64(test.id), 10))
+		response := perform(t, hosted.Client(), request)
+		_ = readResponse(t, response)
+		if response.StatusCode != http.StatusNoContent || response.Header.Get("X-Up-Ack") != "1" {
+			t.Fatalf("lane %d uplink failed: %d", test.id, response.StatusCode)
+		}
+	}
+
+	for _, test := range []struct {
+		id      uint32
+		payload string
+	}{{31, "first lane"}, {32, "second lane"}} {
+		cursor := "0"
+		var received []byte
+		for attempt := 0; attempt != 8 && !bytes.Equal(received, []byte(test.payload)); attempt++ {
+			request := apiRequest(t, http.MethodPost, hosted.URL+"/api/v1/down", token, nil)
+			request.Header.Set("X-Down-Cursor", cursor)
+			request.Header.Set("X-Lane-ID", strconv.FormatUint(uint64(test.id), 10))
+			response := perform(t, hosted.Client(), request)
+			body := readResponse(t, response)
+			if response.StatusCode == http.StatusNoContent {
+				continue
+			}
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("lane %d downlink failed: %d", test.id, response.StatusCode)
+			}
+			cursor = response.Header.Get("X-Down-Cursor")
+			frames, parseErr := frame.ParseAll(body, frame.MaxPayload)
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			for _, value := range frames {
+				if value.StreamID != test.id {
+					t.Fatalf("lane %d received stream %d", test.id, value.StreamID)
+				}
+				if value.Type == frame.Data {
+					received = append(received, value.Payload...)
+				}
+			}
+		}
+		if !bytes.Equal(received, []byte(test.payload)) {
+			t.Fatalf("lane %d did not echo its payload", test.id)
+		}
+	}
+}
+
+func TestWebSocketCarrierRoundTrip(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierWebSocket
+	})
+	defer application.Shutdown()
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	bootstrap, err := application.manager.IssueBootstrap(
+		&application.config.Profiles[0],
+		"198.51.100.7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := perform(t, hosted.Client(), apiRequest(
+		t,
+		http.MethodPost,
+		hosted.URL+"/api/v1/session",
+		bootstrap,
+		frame.Encode(frame.Hello, 0, []byte{1})))
+	_ = readResponse(t, created)
+	token := created.Header.Get("X-Session-Token")
+	if created.StatusCode != http.StatusOK || created.Header.Get("X-Carrier-Mode") != string(config.CarrierWebSocket) || token == "" {
+		t.Fatalf("websocket session creation failed: status=%d", created.StatusCode)
+	}
+
+	hostedAddress := strings.TrimPrefix(hosted.URL, "http://")
+	dialer := websocket.Dialer{
+		Subprotocols: []string{webSocketProtocolPrefix + token},
+		NetDialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, hostedAddress)
+		},
+	}
+	headers := http.Header{
+		"Origin":          []string{"https://" + testHost},
+		"X-Forwarded-For": []string{"198.51.100.7"},
+	}
+	connection, response, err := dialer.Dial("ws://"+testHost+"/api/v1/ws", headers)
+	if err != nil {
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if connection.Subprotocol() != webSocketProtocolPrefix+token {
+		t.Fatal("websocket did not authenticate its subprotocol")
+	}
+	streamID := uint32(41)
+	payload := []byte("websocket round trip")
+	body := append(frame.Encode(frame.Open, streamID, nil), frame.Encode(frame.Data, streamID, payload)...)
+	if err := connection.WriteMessage(websocket.BinaryMessage, body); err != nil {
+		t.Fatal(err)
+	}
+	_ = connection.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var received []byte
+	for !bytes.Equal(received, payload) {
+		messageType, body, err := connection.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if messageType != websocket.BinaryMessage {
+			t.Fatalf("unexpected websocket message type %d", messageType)
+		}
+		frames, err := frame.ParseAll(body, frame.MaxPayload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, value := range frames {
+			if value.Type == frame.Data && value.StreamID == streamID {
+				received = append(received, value.Payload...)
+			}
+		}
+	}
+}
+
 func TestAdminSurfaceIsSeparate(t *testing.T) {
 	backend := startEchoBackend(t)
 	application, _ := newTestServer(t, backend)
@@ -354,15 +513,15 @@ func newConfiguredTestServer(
 	value.PublicDir = directory
 	value.Timeouts.LongPoll = config.Duration(500 * time.Millisecond)
 	value.Timeouts.BackendDial = config.Duration(time.Second)
-	if configure != nil {
-		configure(&value)
-	}
 	secret, _ := hex.DecodeString("000102030405060708090a0b0c0d0e0f")
 	value.Profiles = []config.Profile{{
 		Name:       "default",
 		Backend:    backend,
 		Capability: config.DeriveCapability(testHost, secret),
 	}}
+	if configure != nil {
+		configure(&value)
+	}
 	application, err := New(value)
 	if err != nil {
 		t.Fatal(err)

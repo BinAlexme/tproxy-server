@@ -83,8 +83,9 @@ to a build containing the Android bridge-page extension before the Android clien
 can connect. The current bridge response also declares the hardened execution
 profile from `PROTOCOL.md`: all subresources, workers, media, frames, and the
 enumerated unused browser permissions are denied, and the page has no storage
-dependency. Inline nonce script execution, same-origin Fetch, and the authenticated
-WebMessage boundary remain available.
+dependency. Inline nonce script execution, same-origin Fetch/WSS, and the
+authenticated WebMessage boundary remain available. The selected carrier mode is
+implemented by the server-provided page and does not change the Android boundary.
 
 ## Android source changes
 

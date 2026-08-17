@@ -68,8 +68,10 @@ deployable server with several future products. This revision fixes the followin
 2. A domain-separated HMAC of the hostname and MTProxy secret derives the bridge
    query value. WebView inputs contain that derived value rather than the MTProxy
    secret.
-3. HTTPS long-poll is the only v1 carrier. WebSocket, streaming fetch, H3,
-   Telegram Web integration, calls, and cross-process session resume are deferred.
+3. Profiles can select the baseline serialized HTTPS carrier, stream-aware HTTPS
+   lanes, or one multiplexed WebSocket. Streaming fetch, H3, Telegram Web
+   integration, calls, cross-process session resume, and per-stream WebSockets
+   remain deferred.
 4. Caddy terminates TLS and serves the public site. The Go process is an internal
    application server.
 5. The official MTProxy `-H` and `-p` arguments are ports, not bind addresses.
@@ -230,7 +232,7 @@ Content-Security-Policy:
   default-src 'none';
   base-uri 'none';
   child-src 'none';
-  connect-src 'self';
+  connect-src 'self' wss://site.example;
   font-src 'none';
   form-action 'none';
   frame-ancestors http://127.0.0.1:*;
@@ -257,7 +259,7 @@ headers because it is a different response.
 The page must remain functional with cookies, DOM storage, IndexedDB, Cache
 Storage, workers, service workers, frames, media, downloads, popups, forms, device
 permissions, clipboard access, and cross-origin requests disabled. It uses only
-the nonce-bearing inline script, exact-origin Fetch, timers, typed arrays,
+the nonce-bearing inline script, exact-origin Fetch/WSS, timers, typed arrays,
 same-document history replacement, and its authenticated client boundary.
 
 Do not put a CDN in front of v1. Long polls, in-memory session affinity, request
@@ -306,8 +308,9 @@ After initialization:
 - client-to-bridge `{t:'close'}` says the local client transport was replaced or
   stopped and the bridge must close its relay session.
 
-The bridge does not interpret shared-frame semantics. It validates frame boundaries
-when an injected WebView requires a downlink batch to be split for native IPC. Its
+The bridge interprets only frame boundaries and stream ids when an injected WebView
+requires downlink splitting or `https-lanes` requires routing. It never interprets
+opaque DATA. Its
 first upstream binary message is sent verbatim as the session-creation body; the
 relay validates that it is the v1 `HELLO`. Later binary messages are serialized and
 batched without interpreting DATA.
@@ -317,7 +320,8 @@ Bridge behavior:
 1. Wait for one authenticated client boundary and its first upstream buffer.
 2. `POST /api/v1/session` with the bootstrap token and first buffer.
 3. Forward the returned `WELCOME` body to the client boundary.
-4. Run one serialized uplink queue and one serialized long-poll loop.
+4. Run the profile-selected carrier: one serialized HTTPS pair, one independent
+   HTTPS pair per logical stream, or one multiplexed WebSocket.
 5. Retry ambiguous HTTP failures with the same sequence/cursor and byte-identical
    body, using bounded exponential backoff with jitter.
 6. Report `reconnecting` during transient carrier loss.
@@ -326,10 +330,11 @@ Bridge behavior:
 8. On client close or page shutdown, stop polling and make a best-effort authenticated
    session-close request. Server idle cleanup remains the fallback.
 
-There is no WebSocket in v1. The bridge page makes ordinary same-origin HTTPS POST
-requests only.
+The reference modes and their exact authentication, sequencing, replay, and close
+semantics are specified normatively in `PROTOCOL.md`. The remainder of this section
+describes the original serialized HTTPS baseline.
 
-## 6. HTTP carrier protocol
+## 6. Baseline HTTP carrier protocol
 
 All API requests require:
 
@@ -535,13 +540,12 @@ bodies are never sent through zstd/gzip. On a controlled link with at least
 at 200 ms RTT through each native WebView implementation and, where supported, its
 optional system-browser carrier.
 
-A direct native HTTP transport may keep several POSTs active, so WEB has more RTT
-sensitivity in v1. That serialization, fixed batching, and the current copy count
-are implementation choices rather than requirements of a WebView carrier. An
-ordered bounded pipeline or a compatible streaming carrier can narrow the gap. The
-structural differences are WebView IPC, one extra relay path and TLS leg, and
-shared-carrier head-of-line exposure. Direct transport therefore remains the
-latency and peak-throughput reference.
+The `https-lanes` mode removes this global stop-and-wait ceiling by giving each
+logical stream independent request sequencing and replay state. The `websocket`
+mode removes the HTTP acknowledgement cycle with one ordered, flow-controlled
+socket. WebView IPC, one extra relay path and TLS leg, and some shared-carrier
+head-of-line exposure remain. Direct transport therefore remains the latency and
+peak-throughput reference.
 
 ### 7.4 Performance optimization and consolidation decision
 
@@ -631,7 +635,7 @@ Shutdown order:
    replace the WebView session.
 4. The process exits; systemd may restart it.
 
-V1 does not emit BYE during process shutdown because the HTTP carrier is already
+V1 does not emit BYE during process shutdown because the carrier is already
 draining. BYE remains reserved for a future graceful carrier-level drain.
 
 ## 9. Official MTProxy backend

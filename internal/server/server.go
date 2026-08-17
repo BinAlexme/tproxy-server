@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
@@ -14,11 +15,16 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/telegramdesktop/tproxy-server/internal/bridge"
 	"github.com/telegramdesktop/tproxy-server/internal/config"
+	"github.com/telegramdesktop/tproxy-server/internal/frame"
 	"github.com/telegramdesktop/tproxy-server/internal/session"
 )
+
+const webSocketProtocolPrefix = "tproxy-v1."
 
 type Server struct {
 	config   config.Config
@@ -84,7 +90,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveRoot(w, r)
 		return
 	}
-	if r.URL.Path == "/api/v1/session" || r.URL.Path == "/api/v1/up" || r.URL.Path == "/api/v1/down" {
+	if r.URL.Path == "/api/v1/session" || r.URL.Path == "/api/v1/up" || r.URL.Path == "/api/v1/down" || r.URL.Path == "/api/v1/ws" {
 		s.serveAPI(w, r)
 		return
 	}
@@ -118,6 +124,7 @@ func (s *Server) serveRoot(w http.ResponseWriter, r *http.Request) {
 	page, err := bridge.Render(
 		s.config.PublicHostname,
 		token,
+		string(profile.CarrierMode.WithDefault()),
 		s.config.Limits.CarrierBatchBytes)
 	if err != nil {
 		s.servePublicIndex(w, false)
@@ -145,6 +152,10 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 	clientIP, err := s.clientIP(r)
 	if err != nil {
 		s.serveNotFound(w)
+		return
+	}
+	if r.URL.Path == "/api/v1/ws" {
+		s.serveWebSocket(w, r)
 		return
 	}
 	token, ok := bearerToken(r.Header.Get("Authorization"))
@@ -201,6 +212,7 @@ func (s *Server) serveSession(w http.ResponseWriter, r *http.Request, token, cli
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Session-Token", result.Token)
+	w.Header().Set("X-Carrier-Mode", string(result.Session.CarrierMode()))
 	w.Header().Set("X-Down-Cursor", "0")
 	w.Header().Set("Content-Length", strconv.Itoa(len(result.Welcome)))
 	w.WriteHeader(http.StatusOK)
@@ -227,7 +239,25 @@ func (s *Server) serveUp(w http.ResponseWriter, r *http.Request, token string) {
 		s.serveNotFound(w)
 		return
 	}
-	ack, err := value.ProcessUp(sequence, body)
+	var ack uint64
+	switch value.CarrierMode() {
+	case config.CarrierHTTPS:
+		if r.Header.Get("X-Lane-ID") != "" {
+			s.serveNotFound(w)
+			return
+		}
+		ack, err = value.ProcessUp(sequence, body)
+	case config.CarrierHTTPSLanes:
+		lane, ok := canonicalUint(r.Header.Get("X-Lane-ID"))
+		if !ok || lane > frame.MaxStreamID {
+			s.serveNotFound(w)
+			return
+		}
+		ack, err = value.ProcessUpLane(uint32(lane), sequence, body)
+	default:
+		s.serveNotFound(w)
+		return
+	}
 	if err != nil {
 		if errors.Is(err, session.ErrBackpressure) {
 			w.Header().Set("Cache-Control", "no-store")
@@ -258,7 +288,30 @@ func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string)
 		s.serveNotFound(w)
 		return
 	}
-	body, next, err := value.Poll(r.Context(), cursor)
+	var body []byte
+	var next uint64
+	var laneClosed bool
+	switch value.CarrierMode() {
+	case config.CarrierHTTPS:
+		if r.Header.Get("X-Lane-ID") != "" {
+			s.serveNotFound(w)
+			return
+		}
+		body, next, err = value.Poll(r.Context(), cursor)
+	case config.CarrierHTTPSLanes:
+		lane, ok := canonicalUint(r.Header.Get("X-Lane-ID"))
+		if !ok || lane > frame.MaxStreamID {
+			s.serveNotFound(w)
+			return
+		}
+		body, next, laneClosed, err = value.PollLane(
+			r.Context(),
+			uint32(lane),
+			cursor)
+	default:
+		s.serveNotFound(w)
+		return
+	}
 	if err != nil {
 		if r.Context().Err() != nil {
 			return
@@ -268,6 +321,9 @@ func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string)
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Down-Cursor", strconv.FormatUint(next, 10))
+	if laneClosed {
+		w.Header().Set("X-Lane-Closed", "1")
+	}
 	if len(body) == 0 {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -276,6 +332,122 @@ func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string)
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+}
+
+func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet || r.Header.Get("Authorization") != "" || !emptyBody(r) {
+		s.serveNotFound(w)
+		return
+	}
+	protocols := websocket.Subprotocols(r)
+	if len(protocols) != 1 || !strings.HasPrefix(protocols[0], webSocketProtocolPrefix) {
+		s.serveNotFound(w)
+		return
+	}
+	token := strings.TrimPrefix(protocols[0], webSocketProtocolPrefix)
+	if _, ok := bearerToken("Bearer " + token); !ok {
+		s.serveNotFound(w)
+		return
+	}
+	value, err := s.manager.Get(token)
+	if err != nil || value.CarrierMode() != config.CarrierWebSocket || !value.AcquireWebSocket() {
+		s.serveNotFound(w)
+		return
+	}
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  64 * 1024,
+		WriteBufferSize: 64 * 1024,
+		Subprotocols:    protocols,
+		CheckOrigin: func(request *http.Request) bool {
+			return request.Header.Get("Origin") == "https://"+s.config.PublicHostname
+		},
+	}
+	connection, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		value.Close()
+		return
+	}
+	defer connection.Close()
+	defer value.Close()
+	connection.SetReadLimit(int64(s.config.Limits.MaxBodyBytes))
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	finished := make(chan error, 2)
+	go s.readWebSocket(ctx, connection, value, finished)
+	go s.writeWebSocket(ctx, connection, value, finished)
+	<-finished
+}
+
+func (s *Server) readWebSocket(
+	ctx context.Context,
+	connection *websocket.Conn,
+	value *session.Session,
+	finished chan<- error) {
+	sequence := uint64(1)
+	for {
+		messageType, body, err := connection.ReadMessage()
+		if err != nil {
+			finished <- err
+			return
+		}
+		if messageType != websocket.BinaryMessage || len(body) == 0 {
+			finished <- session.ErrProtocol
+			return
+		}
+		deadline := time.NewTimer(30 * time.Second)
+		for {
+			ack, processErr := value.ProcessUp(sequence, body)
+			if processErr == nil && ack == sequence {
+				if !deadline.Stop() {
+					<-deadline.C
+				}
+				sequence++
+				break
+			}
+			if !errors.Is(processErr, session.ErrBackpressure) {
+				deadline.Stop()
+				finished <- processErr
+				return
+			}
+			select {
+			case <-ctx.Done():
+				deadline.Stop()
+				finished <- ctx.Err()
+				return
+			case <-deadline.C:
+				finished <- session.ErrBackpressure
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	}
+}
+
+func (s *Server) writeWebSocket(
+	ctx context.Context,
+	connection *websocket.Conn,
+	value *session.Session,
+	finished chan<- error) {
+	cursor := uint64(0)
+	for {
+		body, next, err := value.Poll(ctx, cursor)
+		if err != nil {
+			finished <- err
+			return
+		}
+		if len(body) == 0 {
+			continue
+		}
+		if err := connection.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+			finished <- err
+			return
+		}
+		if err := connection.WriteMessage(websocket.BinaryMessage, body); err != nil {
+			finished <- err
+			return
+		}
+		cursor = next
+	}
 }
 
 func (s *Server) bridgeProfile(r *http.Request) *config.Profile {

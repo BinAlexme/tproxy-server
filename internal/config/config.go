@@ -20,6 +20,25 @@ import (
 
 const capabilityContext = "tdesktop-web-proxy-bridge-v1\n"
 
+type CarrierMode string
+
+const (
+	CarrierHTTPS      CarrierMode = "https"
+	CarrierHTTPSLanes CarrierMode = "https-lanes"
+	CarrierWebSocket  CarrierMode = "websocket"
+)
+
+func (m CarrierMode) Valid() bool {
+	return m == CarrierHTTPS || m == CarrierHTTPSLanes || m == CarrierWebSocket
+}
+
+func (m CarrierMode) WithDefault() CarrierMode {
+	if m == "" {
+		return CarrierHTTPS
+	}
+	return m
+}
+
 type Duration time.Duration
 
 func (d *Duration) UnmarshalJSON(input []byte) error {
@@ -92,10 +111,11 @@ type profileFile struct {
 }
 
 type profileInput struct {
-	Name    string        `json:"name"`
-	Secret  string        `json:"secret"`
-	Backend string        `json:"backend"`
-	Limits  ProfileLimits `json:"limits"`
+	Name        string        `json:"name"`
+	Secret      string        `json:"secret"`
+	Backend     string        `json:"backend"`
+	CarrierMode CarrierMode   `json:"carrier_mode"`
+	Limits      ProfileLimits `json:"limits"`
 }
 
 type ProfileLimits struct {
@@ -111,10 +131,11 @@ type ProfileLimits struct {
 }
 
 type Profile struct {
-	Name       string
-	Backend    string
-	Capability [sha256.Size]byte
-	Limits     ProfileLimits
+	Name        string
+	Backend     string
+	CarrierMode CarrierMode
+	Capability  [sha256.Size]byte
+	Limits      ProfileLimits
 }
 
 func (limits ProfileLimits) WithDefaults(global Limits) ProfileLimits {
@@ -423,6 +444,10 @@ func loadProfiles(path, host string, limits Limits) ([]Profile, error) {
 		if err := validateLoopbackAddress(input.Backend); err != nil {
 			return nil, fmt.Errorf("profile %q backend: %w", input.Name, err)
 		}
+		carrierMode := input.CarrierMode.WithDefault()
+		if !carrierMode.Valid() {
+			return nil, fmt.Errorf("profile %q carrier_mode must be https, https-lanes, or websocket", input.Name)
+		}
 		if err := validateProfileLimits(input.Limits, limits); err != nil {
 			return nil, fmt.Errorf("profile %q: %w", input.Name, err)
 		}
@@ -439,10 +464,11 @@ func loadProfiles(path, host string, limits Limits) ([]Profile, error) {
 			return nil, fmt.Errorf("duplicate capability for profile %q", input.Name)
 		}
 		result = append(result, Profile{
-			Name:       input.Name,
-			Backend:    input.Backend,
-			Capability: capability,
-			Limits:     profileLimits,
+			Name:        input.Name,
+			Backend:     input.Backend,
+			CarrierMode: carrierMode,
+			Capability:  capability,
+			Limits:      profileLimits,
 		})
 		names[input.Name] = struct{}{}
 		capabilities[capability] = struct{}{}

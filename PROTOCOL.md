@@ -7,7 +7,7 @@ big-endian.
 A client applies Telegram's normal MTProxy transform first. Its local WEB adapter
 maps every resulting TCP connection to a logical stream and multiplexes those
 streams through one WebView carrier session. The bridge page converts complete
-shared-frame batches into authenticated HTTPS requests; the relay converts each
+shared-frame batches into the profile-selected carrier; the relay converts each
 logical stream back into one TCP connection to its configured stock MTProxy. DATA
 payloads are opaque at every layer after the app's MTProxy transform.
 
@@ -76,7 +76,7 @@ bridge to the app are either JSON control values or one complete shared frame.
 Messages from the app to the bridge use the same representations. A platform may
 use ArrayBuffer, a shared native buffer, or a private base64 envelope across its
 WebView IPC boundary; that private encoding is removed before the value reaches the
-bridge and is not part of the HTTP carrier or shared-frame format.
+bridge and is not part of the selected carrier or shared-frame format.
 
 The bridge splits an aggregated HTTP downlink body at validated frame boundaries
 before sending frames through this direct WebView boundary. Clients should keep
@@ -122,8 +122,9 @@ or manifests. It does not use cookies, DOM storage, IndexedDB, Cache Storage,
 service workers, dedicated/shared workers, popups, downloads, forms, WebRTC, device
 permissions, clipboard access, or cross-origin requests. A client may therefore
 disable those facilities without changing the carrier protocol. It must still
-allow the nonce-bearing inline script, exact-origin HTTPS requests, ordinary
-timers, and the selected authenticated client boundary.
+allow the nonce-bearing inline script, exact-origin HTTPS requests, same-origin WSS
+when the profile selects `websocket`, ordinary timers, and the selected
+authenticated client boundary.
 
 The reference response enforces the same profile with this CSP:
 
@@ -131,7 +132,7 @@ The reference response enforces the same profile with this CSP:
 default-src 'none';
 base-uri 'none';
 child-src 'none';
-connect-src 'self';
+connect-src 'self' wss://H;
 font-src 'none';
 form-action 'none';
 frame-ancestors http://127.0.0.1:*;
@@ -163,11 +164,16 @@ hardened Telegram carrier must independently impose its own navigation, request,
 storage, media, and permission restrictions because a different proxy operator
 controls its own document and response headers.
 
-## HTTP carrier
+## Carrier modes
 
-All API requests have `Origin: https://H`, no cookies, and a bearer token. The
-reference relay rejects a cookie-bearing API request. Binary
-bodies use exactly `Content-Type: application/octet-stream`.
+Each server profile selects one `carrier_mode`: `https`, `https-lanes`, or
+`websocket`. Omitting it preserves the original `https` mode. The choice is embedded
+in the generated bridge page and fixed for the resulting relay session; clients do
+not need a new setting or protocol implementation.
+
+All carrier requests have `Origin: https://H` and no cookies. The reference relay
+rejects a cookie-bearing API request. Binary HTTP bodies use exactly
+`Content-Type: application/octet-stream`.
 
 Session creation exchanges a two-minute bootstrap token atomically and
 idempotently:
@@ -180,6 +186,7 @@ Body: one HELLO frame
 200 OK
 X-Session-Token: session-token
 X-Down-Cursor: 0
+X-Carrier-Mode: https | https-lanes | websocket
 Body: one WELCOME frame
 ```
 
@@ -187,7 +194,9 @@ After a valid bootstrap is authenticated, temporary session-capacity or
 creation-rate exhaustion returns `503 Service Unavailable` with `Retry-After: 1`.
 The bootstrap remains unconsumed so the byte-identical creation request can retry.
 
-Uplink requests are serialized. `X-Up-Seq` begins at `1`. The relay accepts the
+### Serialized HTTPS
+
+In `https` mode, uplink requests are serialized. `X-Up-Seq` begins at `1`. The relay accepts the
 next sequence or a byte-identical retry of the last committed sequence:
 
 ```text
@@ -218,6 +227,64 @@ Empty body
 X-Down-Cursor: 1             X-Down-Cursor: 0
 Body: complete frame batch   Empty body
 ```
+
+The uplink POST and downlink poll run concurrently. With a 2 MiB carrier batch, a
+continuously busy direction has an application-level ceiling of approximately
+`2 MiB / carrier RTT`.
+
+### Stream-aware HTTPS lanes
+
+`https-lanes` keeps the same endpoints and retry rules but assigns one independent
+lane to each shared stream. Every `/up` and `/down` request adds:
+
+```text
+X-Lane-ID: <decimal shared stream id>
+```
+
+Lane zero is reserved for session-level PONG traffic. For a nonzero lane, every
+frame in an uplink body and every frame returned by its downlink poll must have a
+`stream_id` equal to `X-Lane-ID`. A new lane must begin with `OPEN`. Each lane has
+its own `X-Up-Seq`, `X-Up-Ack`, `X-Down-Cursor`, byte-identical retry state, and at
+most one active request in each direction. Therefore two Telegram MTProto sessions
+may both use uplink sequence `1` and make progress independently.
+
+When a lane has delivered and acknowledged all queued bytes after its stream closes,
+the relay returns an empty response with `X-Lane-Closed: 1`; the bridge then stops
+polling that lane. Recently closed lane state is retained with the stream tombstone
+so a lost final uplink response can still be acknowledged idempotently.
+
+This mode mirrors Telegram's native connection allocation and removes carrier-level
+head-of-line blocking between logical sessions. It assumes normal HTTP/2 service at
+the public origin; HTTP/1.1 per-origin connection limits can constrain a large set
+of simultaneous long polls.
+
+### Multiplexed WebSocket
+
+`websocket` mode performs the same HTTPS session creation, then opens:
+
+```text
+GET /api/v1/ws
+Origin: https://H
+Sec-WebSocket-Protocol: tproxy-v1.<session-token>
+```
+
+The relay echoes that exact subprotocol. Each client WebSocket binary message is a
+bounded batch of complete client-to-relay frames. Each relay binary message is a
+bounded batch of complete relay-to-client frames. WebSocket ordering and reliable
+delivery replace the HTTP sequence and cursor headers; the shared per-stream WINDOW
+protocol remains authoritative for end-to-end backpressure. Text messages,
+additional WebSockets for the same relay session, oversized messages, malformed
+frame batches, and an incorrect subprotocol are rejected.
+
+The bridge limits its queued plus browser-buffered uplink to 32 MiB. The relay waits
+up to 30 seconds for temporary backend-write backpressure to clear before closing the
+carrier. A WebSocket loss closes the relay session and every logical stream; this
+reference implementation does not resume a partially delivered WebSocket session.
+
+One multiplexed WebSocket is sufficient for correctness and removes the HTTP
+stop-and-wait ceiling. A WebSocket per Telegram stream would additionally isolate
+TCP loss and congestion between sessions, but greatly increases TLS/WebSocket
+connection count and is not part of the current reference modes.
 
 `DELETE /api/v1/session` with the session bearer closes all streams and is
 idempotent for a currently authenticated session. Tokens are 32 random bytes in
@@ -260,12 +327,12 @@ The Telegram app, not the bridge JavaScript, prepares the shared frames:
 6. Replacing or disabling the WEB proxy closes the carrier session and all of its
    logical streams.
 
-The bridge batches complete client frames into `/up` request bodies and delivers
-complete relay frames from `/down`; it never creates MTProxy payloads or assigns
-stream ids.
+The bridge batches complete client frames and delivers complete relay frames. In
+`https-lanes` it parses only the shared header and frame boundary needed to select a
+lane; it never interprets DATA, creates MTProxy payloads, or assigns stream ids.
 
 The implementation does not emit PING or BYE in v1. A carrier failure closes the
-authenticated HTTP session and the bridge tells the client to replace it.
+authenticated relay session and the bridge tells the client to replace it.
 
 The maximum payload is 1 MiB. Relay DATA chunks are at most 64 KiB. Each stream
 begins with 4 MiB of credit in each direction. Client DATA consumes relay receive

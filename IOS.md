@@ -56,18 +56,21 @@ intentionally emulate the existing Android WebView boundary:
 
 The words `android` and `tproxy-android-init` are legacy wire names in this path,
 not a platform assertion. Reusing them keeps every deployed server compatible. A
-future protocol revision can introduce platform-neutral names, but that would be a
+profile may select serialized HTTPS, stream-aware HTTPS lanes, or multiplexed WSS;
+all three remain inside the server-provided page and use the same WKWebView/native
+message boundary. A future protocol revision can introduce platform-neutral names,
+but that would be a
 versioned cleanup rather than a prerequisite for iOS.
 
 WebKit's script-message boundary is not the public relay protocol. The injected
 shim may base64-encode a complete binary frame inside its private JSON envelope;
 the remote bridge still observes the same ArrayBuffer-or-control-string contract,
-and the HTTP carrier and frame bytes do not change.
+and the selected carrier and frame bytes do not change.
 
 The reference page remains functional when the `WKWebView` uses a nonpersistent
 data store and the app blocks storage, subframes, media, popups, downloads,
 permissions, and navigation away from the configured origin. The page still needs
-its nonce-bearing inline script, exact-origin Fetch, timers, typed arrays,
+its nonce-bearing inline script, exact-origin Fetch/WSS, timers, typed arrays,
 same-document history replacement, and the authenticated script-message boundary.
 
 ## WKWebView boundary
