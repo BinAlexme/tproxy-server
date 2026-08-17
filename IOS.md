@@ -105,6 +105,85 @@ Ordinary DATA is at most 64 KiB and the protocol payload maximum is 1 MiB. Base6
 copying is acceptable for a proof of concept, but memory and latency must be
 measured before treating it as a production transport.
 
+## Required WKWebView hardening
+
+The carrier must receive its own `WKWebViewConfiguration`; never retrofit these
+restrictions onto Telegram's Mini Apps, payments, 3-D Secure, Instant View embeds,
+location picker, or another shared `WKProcessPool`/data store. Use
+`WKWebsiteDataStore.nonPersistent()` and a fresh `WKUserContentController` for
+each carrier lifetime.
+
+Install a main-frame-only `WKUserScript` at document start, before the bridge shim
+and before provider JavaScript. It must add an independent meta CSP with the exact
+policy below, add
+`<meta http-equiv="x-dns-prefetch-control" content="off">`, and make the unused
+storage/device globals unavailable with nonreplaceable properties:
+
+```text
+default-src 'none';
+base-uri 'none';
+child-src 'none';
+connect-src https://H wss://H;
+font-src 'none';
+form-action 'none';
+frame-src 'none';
+img-src 'none';
+manifest-src 'none';
+media-src 'none';
+object-src 'none';
+script-src 'unsafe-inline';
+style-src 'none';
+worker-src 'none'
+```
+
+The provider may put its carrier implementation inline, but it cannot load
+external code or resources, create frames/workers, or connect away from exact
+`H`. Also shadow `localStorage`, `sessionStorage`, IndexedDB, Cache Storage,
+workers, `BroadcastChannel`, browser audio constructors, clipboard/device APIs,
+`window.open`, and `document.cookie`. Make `print`, `alert`, `confirm`, and
+`prompt` inert too. The shims are surface reduction; WebKit's CSP and native
+delegates are the security boundary. Do not add `'unsafe-eval'`,
+`blob:`, `data:`, wildcard hosts, alternate ports, or an HTTP source.
+
+Set `mediaTypesRequiringUserActionForPlayback` to all audiovisual media, disable
+AirPlay and picture-in-picture where the platform exposes those switches, keep the
+view noninteractive, and deny every media-capture, orientation/motion, and other
+permission callback. Return no view from popup creation, return no URLs from file
+panels, cancel downloads, and never present JavaScript dialogs for the hidden
+carrier.
+
+In `WKNavigationDelegate`:
+
+- allow only the initial main-frame canonical
+  `https://H/?bridge=...#android=<nonce>` navigation;
+- cancel redirects, new windows, download navigations, subframe navigations,
+  user-info URLs, IP literals, alternate ports, and every other scheme or host;
+- use normal system TLS validation and cancel authentication challenges rather
+  than accepting an untrusted certificate; and
+- treat web-content process termination or loss of responsiveness as carrier
+  failure and discard the entire view/configuration.
+
+`WKNavigationDelegate` does not observe all Fetch/WSS/subresource traffic. The
+document-start CSP is therefore mandatory even when navigation checks are exact.
+A compiled `WKContentRuleList` may additionally block HTTP(S) resources outside
+`H`, but it does not replace CSP coverage of script-created transports. Failure to
+install the document-start policy must fail closed before navigation.
+
+There is no public per-view switch that rejects every first-party cookie while
+leaving other WKWebViews alone. The nonpersistent store prevents disk persistence,
+the document shim removes ordinary DOM cookie access, and the reference bridge
+uses `credentials: 'omit'`; a provider can still create same-origin session state
+inside its disposable store. That state can reach only the already selected proxy
+origin and disappears with the carrier, so do not weaken unrelated Telegram
+WebViews with global cleanup.
+
+The provider deliberately retains unrestricted computation and same-origin
+request scheduling so it can experiment with batching, padding, HTTPS lanes, or
+WebSockets. Native frame/queue bounds, bridge heartbeat deadlines, renderer
+termination handling, and foreground lifecycle are the resource-abuse boundary.
+WebRTC is outside the reference transport and is not claimed to be reliably
+disabled across all engines.
+
 ## iOS source changes
 
 The implementation is isolated in a new Swift `WebProxyTransport` module

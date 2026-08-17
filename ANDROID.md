@@ -47,11 +47,11 @@ The listener accepts only main-frame messages from that exact origin and require
 a random 32-byte nonce delivered in the URL fragment. The fragment is never sent
 to the server and the bridge removes it immediately.
 
-The installed Android System WebView must expose both
-`WEB_MESSAGE_LISTENER` and `WEB_MESSAGE_ARRAY_BUFFER`. AndroidX WebKit 1.14.0 was
-chosen because it exposes those feature checks while retaining the upstream app's
-API 21 minimum. A missing feature fails closed by pointing tgnet at an unused
-loopback port; it never falls back to a direct Telegram connection.
+The installed Android System WebView must expose `WEB_MESSAGE_LISTENER`,
+`WEB_MESSAGE_ARRAY_BUFFER`, and `DOCUMENT_START_SCRIPT`. AndroidX WebKit 1.14.0
+was chosen because it exposes those feature checks while retaining the upstream
+app's API 21 minimum. A missing feature fails closed by pointing tgnet at an
+unused loopback port; it never falls back to a direct Telegram connection.
 
 The transport is foreground-scoped. It does not request foreground-service status
 or elevated renderer priority. If the renderer dies while Telegram is backgrounded,
@@ -62,6 +62,88 @@ continuity is neither required nor promised.
 The HTTPS bridge splits downlink carrier batches into individual validated frames
 before crossing WebView IPC. This keeps ordinary messages around 64 KiB and avoids
 passing a full 2 MiB long-poll response through a single WebMessage.
+
+## Required WebView hardening
+
+Apply these settings only to the private carrier WebView. Telegram's Mini Apps,
+payments, Instant View embeds, location picker, and other browser surfaces need
+their existing profiles and capabilities. In particular, do not change the
+process-global cookie or service-worker policy to harden this one view.
+
+Before the first `loadUrl`, use
+`WebViewCompat.addDocumentStartJavaScript` with the same exact-origin rule as the
+message listener. The script must run before provider JavaScript and install a
+second CSP independent of the response headers. It should also install
+`<meta http-equiv="x-dns-prefetch-control" content="off">` before provider
+markup is parsed:
+
+```text
+default-src 'none';
+base-uri 'none';
+child-src 'none';
+connect-src https://H wss://H;
+font-src 'none';
+form-action 'none';
+frame-src 'none';
+img-src 'none';
+manifest-src 'none';
+media-src 'none';
+object-src 'none';
+script-src 'unsafe-inline';
+style-src 'none';
+worker-src 'none'
+```
+
+`'unsafe-inline'` is intentional: the provider controls the self-contained carrier
+script. Omitting `'unsafe-eval'`, every resource source, and every origin except
+exact HTTPS/WSS `H` still prevents external code, subframes, workers, media, and
+off-origin traffic. The same document-start script should replace `localStorage`,
+`sessionStorage`, IndexedDB, Cache Storage, workers, `BroadcastChannel`, browser
+audio constructors, clipboard/device APIs, `window.open`, and `document.cookie`
+with nonreplaceable unavailable shims. Replace `print`, `alert`, `confirm`, and
+`prompt` with inert functions as well. These shims reduce exposed surface; the
+CSP and native policy remain the security boundary.
+
+Configure the carrier instance as follows:
+
+- keep JavaScript enabled, but disable DOM storage and database storage;
+- use `LOAD_NO_CACHE`, clear only carrier-owned cache state, and never share a
+  carrier data directory/profile with an ordinary Telegram WebView;
+- disable file and content access, mixed content, image loading, geolocation,
+  automatic windows, form-data saving, and multiple-window support;
+- require a real user gesture for media playback and leave the hidden view without
+  any user interaction path;
+- keep Safe Browsing enabled and never install a certificate-error bypass;
+- deny every `WebChromeClient` permission, geolocation, file chooser, popup, and
+  window-creation callback; ignore every download request; and
+- accept main-frame navigation only to the one canonical nonce-bearing bridge URL.
+  Reject redirects, subframes, IP literals, user info, non-443 ports, HTTP, and
+  every new-window navigation.
+
+`shouldInterceptRequest` should return an empty failure response for HTTP(S)
+requests whose scheme, canonical host, or effective port differs from
+`https://H:443`. It is defense in depth, not the only allowlist: Android request
+interception does not cover every browser transport, so the injected CSP is also
+required to constrain WSS and future script-created connections. Continue to
+validate the main-frame origin, active WebView, nonce, and current navigation at
+the WebMessage boundary.
+
+Baseline Android's `CookieManager.setAcceptCookie` is process-global. Do not call
+it if the process contains other Telegram WebViews. Prefer a disposable isolated
+WebView profile when the installed provider exposes one; otherwise disable DOM
+cookie access in the document-start script, keep the reference bridge's
+`credentials: 'omit'`, and never reuse carrier browser state. This prevents
+persistent tracking without silently breaking Mini Apps or payments. Destroy the
+view, remove its message listener and scripts, and delete only its disposable
+profile when the carrier stops.
+
+The provider can still spend CPU or memory and can generate arbitrary amounts of
+same-origin carrier traffic; those are inherent in granting it transport-shaping
+freedom. Treat an unresponsive/terminated renderer, bridge heartbeat timeout,
+native queue limit, or frame-size violation as carrier failure, destroy the whole
+private profile, and recreate it only while Telegram is foregrounded. WebRTC is
+not part of the reference transport and is not claimed to be reliably disabled on
+all client engines.
 
 ## Server changes
 
