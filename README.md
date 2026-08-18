@@ -53,12 +53,14 @@ session.
 
 See [`PROTOCOL.md`](PROTOCOL.md) for the normative wire contract and
 [`PLAN.md`](PLAN.md) for the architecture, limits, implementation rationale, and
-remaining proof-of-concept work.
+remaining proof-of-concept work. [`PUBLIC_SITE.md`](PUBLIC_SITE.md) defines the
+operator-owned website extension points.
 
 The reference deployment layout is:
 
 ```text
-Internet :80/:443 -> Caddy -> 127.0.0.1:8080 tproxy-server -> static website (from memory)
+Internet :80/:443 -> Caddy -> 127.0.0.1:8080 tproxy-server -> operator site
+                                              |                (memory or loopback app)
                                               \-> 127.0.0.1:2398 official MTProxy
 ```
 
@@ -66,15 +68,14 @@ Only Caddy listens on external interfaces. The relay, its admin endpoints, the
 official MTProxy client port, and MTProxy statistics remain local. The relay never
 receives a client-selected backend address and never decrypts the MTProxy stream.
 
-Caddy proxies **every** path to the relay, and the relay serves the whole public
-site from memory (loaded from `public_dir` at start-up) through one code path with
-one header set. A prober without a valid capability therefore cannot distinguish
-this host from the same static site: `/`, `/?anything`, unauthenticated
-`/api/v1/*`, and any other miss produce byte-, header- and timing-identical
-responses per method, the capability scan runs in constant time on every `GET /`,
-and only `GET /?bridge=<valid capability>` differs. Restart the relay
-(`sudo systemctl restart tproxy-server`) after changing files under `public_dir`;
-the site is read once at start-up.
+Caddy proxies **every** path to the relay. In static mode the relay serves the
+whole site from memory through one code path and one header set. In application
+mode it delegates ordinary and unauthenticated requests to one private loopback
+web application. A request that proves knowledge of a bridge or session token is
+intercepted before that application. In either mode there is no separately hosted
+relay path for an unauthenticated prober to compare with the public site, and only
+`GET /?bridge=<valid capability>` reveals the bridge. Restart the relay after
+changing files under `public_dir`; the static site is read once at start-up.
 
 ## What you need
 
@@ -82,8 +83,10 @@ the site is read once at start-up.
 - an **x86_64** Linux server with a public IPv4 address, SSH access, systemd, and
   either Ubuntu 22.04+ or Debian 12+;
 - root or passwordless `sudo` on that server;
-- public inbound TCP 80 and 443; and
-- one random 16-byte secret.
+- public inbound TCP 80 and 443;
+- one random 16-byte secret; and
+- an operator-owned static site or a web application bound to a private loopback
+  port.
 
 The automated installer is intended for a clean server on which Caddy may own ports
 80/443. It backs up an existing `/etc/caddy/Caddyfile`, but it then replaces the
@@ -123,14 +126,23 @@ entered in every client that uses this server and passed to the installer.
 
 ## 2. Prepare the real public site
 
-The repository includes a small, self-contained site named “Quiet Systems” under
-`web/public`. It has an index, about page, privacy page, custom 404, stylesheet,
-favicon, and robots file, with no third-party resources. It is usable as a starter,
-but a hostname you publish should contain content that is genuinely yours.
+The repository deliberately does not include a deployable public website. If many
+operators installed the same starter, its body and assets would become an easy
+active-probing signature. The simplest choice is a static site that genuinely
+belongs to the operator, with generated files in a directory such as `../my-site`.
 
-Edit those files before uploading, or edit `/srv/tproxy-site` after installation.
-Do not add third-party analytics to the bridge page; the bridge page is generated
-inside the relay and never loads public-site assets.
+The only required file is `index.html`. A several-page site will normally also
+have `about.html`, `privacy.html`, `404.html`, `styles.css`, a favicon, and images.
+The relay supports clean links such as `/about` for `about.html`; no framework or
+build step is required. See [`PUBLIC_SITE.md`](PUBLIC_SITE.md) for the complete
+package contract and a prompt suitable for a site generator.
+
+For a database-backed site, accounts, forms, server rendering, an existing CMS,
+site APIs, SSE, or WebSockets, run any HTTP application on a numeric loopback
+address such as `127.0.0.1:3000`. The relay can use it as `public_upstream` while
+remaining the only public gateway. The application owns its framework, headers,
+cookies, and persistence; four exact transport paths remain reserved. This mode
+is specified in [`PUBLIC_SITE.md`](PUBLIC_SITE.md).
 
 ## 3. Configure the hosting firewall
 
@@ -172,7 +184,17 @@ ssh YOUR_SSH_USER@YOUR_SERVER_PUBLIC_IP
 cd /tmp/tproxy-server
 sudo ./deploy/install.sh \
   --hostname proxy.example.com \
-  --email you@example.com
+  --email you@example.com \
+  --site-dir ../my-site
+```
+
+For a local web application that is already running, use:
+
+```bash
+sudo ./deploy/install.sh \
+  --hostname proxy.example.com \
+  --email you@example.com \
+  --site-upstream http://127.0.0.1:3000
 ```
 
 The backend defaults to one official MTProxy worker and 4096 accepted client
@@ -197,7 +219,8 @@ The installer:
    unprivileged `mtproxy` user, and installs the result as root;
 3. downloads the official MTProxy secret and routing configuration over HTTPS;
 4. runs all Go tests and installs `/usr/local/bin/tproxy-server`;
-5. installs the public site without overwriting an existing `/srv/tproxy-site`;
+5. installs the operator-supplied static site without overwriting an existing
+   `/srv/tproxy-site`, or configures the private site application;
 6. creates mode-restricted configuration and a systemd credential for the WEB
    secret;
 7. installs the backend firewall, relay, MTProxy, refresh timer, and Caddy units; and
@@ -311,10 +334,13 @@ go build -trimpath -o tproxy-server ./cmd/tproxy-server
 sudo install -m 0755 tproxy-server /usr/local/bin/tproxy-server
 ```
 
-Create `/srv/tproxy-site`, `/etc/tproxy-server/config.json`, and a mode-`0400`
-profiles file from `config.example.json` and `profiles.example.json`. When not using
-systemd `LoadCredential`, point `profiles_file` directly at the mode-restricted file.
-Both relay listeners and every backend address must be numeric loopback addresses.
+Install an operator-owned static site in `/srv/tproxy-site` or configure a local
+web application as described in [`PUBLIC_SITE.md`](PUBLIC_SITE.md), then create
+`/etc/tproxy-server/config.json` and a mode-`0400` profiles file from
+`config.example.json` and `profiles.example.json`. When not using systemd
+`LoadCredential`, point `profiles_file` directly at the mode-restricted file. Both
+relay listeners, the public application, and every backend address must use
+numeric loopback addresses.
 
 Build the official backend with `deploy/install-mtproxy.sh`, install the supplied
 systemd units, and let the relay serve the whole hostname:
@@ -328,11 +354,11 @@ reverse_proxy 127.0.0.1:8080 {
 }
 ```
 
-Do not keep a separate `file_server` for the statics on this hostname: the relay
-serves them from `public_dir` so that relay-served and file-served paths cannot be
-told apart (encoding, `ETag`/`Last-Modified`/`Accept-Ranges`, method handling, or
-an extra reverse-proxy hop are all probing tells). Set the server `timeouts` as in
-`deploy/Caddyfile` (`read_body` well above `long_poll`).
+Do not route either static files or a site application around the relay on this
+hostname. The relay must remain the one gateway so that encoding, response
+headers, method handling, and reverse-proxy-hop timing do not expose a separate
+transport surface. Set the server `timeouts` as in `deploy/Caddyfile` (`read_body`
+well above `long_poll`).
 
 The relay must receive the original `Host`. The supplied direct-to-origin Caddy
 layout relies on Caddy's default sanitizing of forwarded client addresses; if you

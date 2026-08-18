@@ -195,7 +195,7 @@ func TestAPIRejectsWrongOriginAsPublic404(t *testing.T) {
 	request.Header.Set("Origin", "https://wrong.example")
 	response := perform(t, hosted.Client(), request)
 	body := readResponse(t, response)
-	if response.StatusCode != http.StatusNotFound || !bytes.Contains(body, []byte("Quiet Systems")) {
+	if response.StatusCode != http.StatusNotFound || !bytes.Contains(body, []byte("Operator Site")) {
 		t.Fatal("invalid API request did not receive the ordinary public 404")
 	}
 }
@@ -616,6 +616,77 @@ func TestWebSocketLanesRemainIndependent(t *testing.T) {
 	}
 }
 
+func TestDynamicPublicUpstreamAndTransportCoexist(t *testing.T) {
+	backend := startEchoBackend(t)
+	var requests []string
+	public := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests = append(requests, strings.Join([]string{
+			r.Method,
+			r.URL.RequestURI(),
+			r.Host,
+			r.Header.Get("Authorization"),
+			string(body),
+		}, " "))
+		w.Header().Set("X-Public-Application", "yes")
+		w.WriteHeader(http.StatusTeapot)
+		_, _ = io.WriteString(w, "dynamic site")
+	}))
+	defer public.Close()
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.PublicDir = ""
+		value.PublicUpstream = public.URL
+	})
+	defer application.Shutdown()
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	for _, target := range []string{
+		"/article?id=7",
+		"/?bridge=not-a-capability",
+		"/api/v1/session",
+	} {
+		response := perform(t, hosted.Client(), request(t, http.MethodGet, hosted.URL+target, nil, ""))
+		body := readResponse(t, response)
+		if response.StatusCode != http.StatusTeapot ||
+			response.Header.Get("X-Public-Application") != "yes" ||
+			string(body) != "dynamic site" {
+			t.Fatalf("%s was not delegated to the public application: %d %q", target, response.StatusCode, body)
+		}
+	}
+	invalidCarrier := request(t, http.MethodPost, hosted.URL+"/api/v1/up", []byte("opaque carrier data"), "")
+	invalidCarrier.Header.Set("Origin", "https://"+testHost)
+	invalidCarrier.Header.Set("Authorization", "Bearer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+	invalidCarrier.Header.Set("Content-Type", "application/octet-stream")
+	invalidCarrier.Header.Set("X-Up-Seq", "1")
+	response := perform(t, hosted.Client(), invalidCarrier)
+	_ = readResponse(t, response)
+	if response.StatusCode != http.StatusTeapot {
+		t.Fatalf("invalid carrier did not receive the application fallback: %d", response.StatusCode)
+	}
+	secret, _ := hex.DecodeString("000102030405060708090a0b0c0d0e0f")
+	capability := config.CapabilityString(config.DeriveCapability(testHost, secret))
+	response = perform(t, hosted.Client(), request(t, http.MethodGet, hosted.URL+"/?bridge="+capability, nil, ""))
+	body := readResponse(t, response)
+	if response.StatusCode != http.StatusOK ||
+		response.Header.Get("X-Public-Application") != "" ||
+		!bytes.Contains(body, []byte("/api/v1/session")) {
+		t.Fatalf("valid bridge was delegated to the public application: %d", response.StatusCode)
+	}
+	if len(requests) != 4 {
+		t.Fatalf("public application received %d requests, want 4: %v", len(requests), requests)
+	}
+	for i, got := range requests {
+		if !strings.Contains(got, " "+testHost+" ") {
+			t.Fatalf("public application did not receive the original Host: %q", got)
+		}
+		if i == len(requests)-1 &&
+			(strings.Contains(got, "Bearer") || strings.Contains(got, "opaque carrier data")) {
+			t.Fatalf("carrier credentials or body reached the public application: %q", got)
+		}
+	}
+}
+
 func TestAdminSurfaceIsSeparate(t *testing.T) {
 	backend := startEchoBackend(t)
 	application, _ := newTestServer(t, backend)
@@ -667,8 +738,8 @@ func newConfiguredTestServer(
 	configure func(*config.Config)) (*Server, []byte) {
 	t.Helper()
 	directory := t.TempDir()
-	index := []byte("<!doctype html><title>Quiet Systems</title><p>ordinary site</p>")
-	notFound := []byte("<!doctype html><title>Not found</title><p>Quiet Systems</p>")
+	index := []byte("<!doctype html><title>Operator Site</title><p>ordinary site</p>")
+	notFound := []byte("<!doctype html><title>Not found</title><p>Operator Site</p>")
 	if err := os.WriteFile(filepath.Join(directory, "index.html"), index, 0600); err != nil {
 		t.Fatal(err)
 	}

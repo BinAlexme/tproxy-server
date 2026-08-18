@@ -28,7 +28,7 @@ unmodified MTProxy.
 Telegram app                |                                  |
   MTProto + MTProxy bytes    |  Caddy :443                      |
           |                  |  +----------------------------+  |
-          v                  |  | public static website      |  |
+          v                  |  | relay public gateway       |  |
 local WEB adapter            |  | bridge + /api/v1/*         |  |
   one logical stream per     |  +-------------+--------------+  |
   app TCP connection         |                |                 |
@@ -89,19 +89,22 @@ deployable server with several future products. This revision fixes the followin
 
 The hostname given to users is also the TLS SNI hostname. Its root behavior is:
 
-- `GET /` without the exact bridge capability returns the static home page.
+- `GET /` without the exact bridge capability returns the public site's home page.
 - Missing, incorrect, duplicated, malformed, or extra query parameters also return
   the same home page with status `200`.
-- Static pages and assets include at least `/about`, `/privacy`, `/favicon.ico`,
-  `/robots.txt`, CSS, and a normal custom `404` page.
+- A simple static deployment includes normal pages and assets such as `/about`,
+  `/privacy`, `/favicon.ico`, `/robots.txt`, CSS, and a custom `404` page. A more
+  complex deployment may delegate the public surface to a private loopback web
+  application.
 - Public HTML and assets are separate from the dynamically generated bridge page.
 - The site uses content owned by the operator.
 - Public responses are cacheable where appropriate and use a normal site CSP.
 - HTTPS on the configured hostname does not redirect to another hostname; otherwise
   the parent's exact `postMessage` target origin would no longer match.
 
-The static site can initially be small and lets the same hostname host regular web
-content alongside the WebView transport.
+The operator site can initially be small. It may later become a full application
+without changing the bridge protocol, provided every public request continues to
+pass through the relay gateway.
 
 ### 3.2 Derived bridge URL
 
@@ -215,11 +218,10 @@ Caddy responsibilities:
 - obtain and renew a normal certificate for the public hostname;
 - negotiate HTTP/1.1 and HTTP/2 normally;
 - apply standard response headers;
-- reverse proxy every path to Go: Go serves the public site from memory, chooses
-  public index versus bridge on `/`, and answers unauthenticated `/api/v1/*` and
-  every other miss through the same code path with the same headers, so no
-  request without a valid capability can tell relay-served from file-served
-  paths (there is no separate `file_server` and no second hop);
+- reverse proxy every path to Go: Go serves a static site from memory or delegates
+  to one private site application, chooses public response versus bridge on `/`,
+  and sends unauthenticated transport-shaped requests through that same public
+  source, so there is no separate probeable transport route at Caddy;
 - when the Go upstream is down, answer every path the same way, like any other
   backend-down site — no path is special-cased in the error handler;
 - preserve streaming/long-poll responses and use a timeout longer than the relay's
@@ -695,7 +697,7 @@ firewall rule. Also verify `127.0.0.1:8888/stats` and a local TCP dial to 2398.
 
 The public site must remain healthy when MTProxy is down. The relay readiness check
 reports backend failure only on a loopback-only admin endpoint; an `OPEN` receives
-`CLOSE` rather than taking down Caddy or the static site.
+`CLOSE` rather than taking down Caddy or the operator site.
 
 ### 9.1 Multiple secrets and profiles
 
@@ -798,6 +800,7 @@ limits to every session.
 tproxy-server/
 ├── PLAN.md
 ├── PROTOCOL.md
+├── PUBLIC_SITE.md
 ├── README.md
 ├── go.mod
 ├── cmd/
@@ -808,8 +811,6 @@ tproxy-server/
 │   ├── bridge/                 # dynamic HTML + inline JS
 │   ├── session/                # seq/cursor, streams, flow control, budgets
 │   └── server/                 # carrier, public site, admin handlers
-├── web/
-│   └── public/                 # static site and assets
 ├── deploy/
 │   ├── Caddyfile
 │   ├── caddy.service
@@ -826,10 +827,12 @@ tproxy-server/
 └── *_test.go                   # colocated unit and fake-backend integration tests
 ```
 
-Use Go's standard library where possible. A small maintained WebSocket dependency is
-not needed in v1. The bridge script is plain JavaScript with no package manager or
-build step. Static files may be embedded for development, while production may read
-the configured site directory so content can change without rebuilding the relay.
+Use Go's standard library where possible and the maintained Gorilla WebSocket
+package for protocol upgrades. The bridge script is plain JavaScript with no
+package manager or build step. The public website is operator-owned input and is
+never embedded in the relay or supplied as a common default. It is either read
+from a configured static directory or delegated to one private loopback HTTP
+application.
 
 Configuration fields:
 
@@ -837,7 +840,8 @@ Configuration fields:
 public_hostname     site.example
 listen              127.0.0.1:8080
 admin_listen        127.0.0.1:8081
-public_dir          /srv/tproxy-site
+public_dir          /srv/tproxy-site                # choose this, or
+public_upstream     http://127.0.0.1:3000            # choose this
 profiles_file       /run/credentials/tproxy-server.service/profiles.json
 enable_pprof        false
 limits              explicit values from section 10
@@ -848,9 +852,9 @@ Each profile contains a client-facing WEB secret, fixed loopback backend
 address, and optional limit overrides. The relay derives capabilities at startup; no
 bridge capability is stored in configuration.
 
-Startup rejects an invalid public DNS hostname, non-loopback listen/admin or
-profile backend address, invalid/duplicate profile secret or capability, missing
-static site, or inconsistent limits.
+Startup rejects an invalid public DNS hostname, non-loopback listen/admin,
+public-upstream, or profile backend address, invalid/duplicate profile secret or
+capability, missing or multiple public sources, or inconsistent limits.
 
 ## 12. Implementation sequence
 
@@ -880,7 +884,7 @@ loss, reordering, or unbounded memory.
 
 ### M2 — public site, bridge page, and WebView carrier
 
-1. Add the operator-owned static site and Caddy configuration.
+1. Add the operator-owned website source and Caddy configuration.
 2. Implement root capability selection, public-site response, dynamic bridge CSP,
    bootstrap issuance, and sanitized logs.
 3. Implement injected-WebView and MessageChannel validation plus the serialized

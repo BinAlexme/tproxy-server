@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -108,6 +109,7 @@ type Config struct {
 	Listen         string    `json:"listen"`
 	AdminListen    string    `json:"admin_listen"`
 	PublicDir      string    `json:"public_dir"`
+	PublicUpstream string    `json:"public_upstream"`
 	ProfilesFile   string    `json:"profiles_file"`
 	EnablePprof    bool      `json:"enable_pprof"`
 	Limits         Limits    `json:"limits"`
@@ -277,12 +279,19 @@ func (c Config) validate() error {
 	if c.Listen == c.AdminListen {
 		return errors.New("listen and admin_listen must differ")
 	}
-	info, err := os.Stat(c.PublicDir)
-	if err != nil || !info.IsDir() {
-		return fmt.Errorf("public_dir is not a directory: %s", c.PublicDir)
+	if (c.PublicDir == "") == (c.PublicUpstream == "") {
+		return errors.New("exactly one of public_dir or public_upstream is required")
 	}
-	if _, err := os.Stat(filepath.Join(c.PublicDir, "index.html")); err != nil {
-		return errors.New("public_dir must contain index.html")
+	if c.PublicDir != "" {
+		info, err := os.Stat(c.PublicDir)
+		if err != nil || !info.IsDir() {
+			return fmt.Errorf("public_dir is not a directory: %s", c.PublicDir)
+		}
+		if _, err := os.Stat(filepath.Join(c.PublicDir, "index.html")); err != nil {
+			return errors.New("public_dir must contain index.html")
+		}
+	} else if err := validatePublicUpstream(c.PublicUpstream); err != nil {
+		return fmt.Errorf("public_upstream: %w", err)
 	}
 	if c.ProfilesFile == "" {
 		return errors.New("profiles_file is required")
@@ -407,6 +416,23 @@ func validateLoopbackAddress(address string) error {
 	value, err := strconv.Atoi(port)
 	if err != nil || value < 1 || value > 65535 {
 		return errors.New("invalid port")
+	}
+	return nil
+}
+
+func validatePublicUpstream(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if parsed.Scheme != "http" {
+		return errors.New("must use http on a numeric loopback address")
+	}
+	if parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("must contain only scheme, loopback address, and port")
+	}
+	if err := validateLoopbackAddress(parsed.Host); err != nil {
+		return err
 	}
 	return nil
 }

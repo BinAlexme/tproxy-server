@@ -10,7 +10,9 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/http/pprof"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +44,7 @@ type Server struct {
 	config           config.Config
 	manager          *session.Manager
 	site             *staticSite
+	publicUpstream   http.Handler
 	bodyReadDeadline time.Duration
 }
 
@@ -49,14 +52,30 @@ func New(value config.Config) (*Server, error) {
 	if err := session.ValidateBudget(value); err != nil {
 		return nil, err
 	}
-	site, err := loadStaticSite(value.PublicDir)
-	if err != nil {
-		return nil, err
+	var site *staticSite
+	var publicUpstream http.Handler
+	if value.PublicDir != "" {
+		var err error
+		site, err = loadStaticSite(value.PublicDir)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		target, err := url.Parse(value.PublicUpstream)
+		if err != nil {
+			return nil, err
+		}
+		proxy := httputil.NewSingleHostReverseProxy(target)
+		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
+			http.Error(w, "site unavailable", http.StatusBadGateway)
+		}
+		publicUpstream = proxy
 	}
 	return &Server{
 		config:           value,
 		manager:          session.NewManager(value),
 		site:             site,
+		publicUpstream:   publicUpstream,
 		bodyReadDeadline: bodyReadDeadline,
 	}, nil
 }
@@ -97,7 +116,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.setReadDeadline(w)
 	}
 	if r.Host != s.config.PublicHostname && r.Host != s.config.PublicHostname+":443" {
-		s.serveNotFound(w, r)
+		s.serveWrongHost(w, r)
 		return
 	}
 	switch r.URL.Path {
@@ -118,23 +137,23 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveRoot(w http.ResponseWriter, r *http.Request) {
-	// bridgeProfile always runs the constant-time capability scan, so GET /,
-	// GET /?x=1 and GET /?bridge=<43 random chars> do byte-, header- and
-	// timing-identical work; only a real capability match takes the branch
-	// below, which a prober can never reach.
+	// bridgeProfile always runs the constant-time capability scan. Static mode
+	// gives every nonmatching root query the exact same response; application
+	// mode delegates all of them to the same operator-owned public handler.
+	// Only a real capability match takes the branch below.
 	profile := s.bridgeProfile(r)
 	if profile == nil || r.Method != http.MethodGet {
-		s.serveEntry(w, r, s.site.index, http.StatusOK)
+		s.servePublicRoot(w, r)
 		return
 	}
 	clientIP, err := s.clientIP(r)
 	if err != nil {
-		s.serveEntry(w, r, s.site.index, http.StatusOK)
+		s.servePublicRootWithoutCapability(w, r)
 		return
 	}
 	token, err := s.manager.IssueBootstrap(profile, clientIP)
 	if err != nil {
-		s.serveEntry(w, r, s.site.index, http.StatusOK)
+		s.servePublicRootWithoutCapability(w, r)
 		return
 	}
 	page, err := bridge.Render(
@@ -143,7 +162,7 @@ func (s *Server) serveRoot(w http.ResponseWriter, r *http.Request) {
 		string(profile.CarrierMode.WithDefault()),
 		s.config.Limits.CarrierBatchBytes)
 	if err != nil {
-		s.serveEntry(w, r, s.site.index, http.StatusOK)
+		s.servePublicRootWithoutCapability(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -618,6 +637,10 @@ func (s *Server) clientIP(r *http.Request) (string, error) {
 }
 
 func (s *Server) serveStatic(w http.ResponseWriter, r *http.Request) {
+	if s.publicUpstream != nil {
+		s.servePublicUpstream(w, r)
+		return
+	}
 	if entry := s.site.resolve(r.URL.Path); entry != nil {
 		s.serveEntry(w, r, entry, http.StatusOK)
 		return
@@ -626,7 +649,80 @@ func (s *Server) serveStatic(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveNotFound(w http.ResponseWriter, r *http.Request) {
+	if s.publicUpstream != nil {
+		if isTransportPath(r.URL.Path) {
+			r = sanitizedPublicFallback(r)
+		}
+		s.servePublicUpstream(w, r)
+		return
+	}
 	s.serveEntry(w, r, s.site.notFound, http.StatusNotFound)
+}
+
+func (s *Server) servePublicRoot(w http.ResponseWriter, r *http.Request) {
+	if s.publicUpstream != nil {
+		s.servePublicUpstream(w, r)
+		return
+	}
+	s.serveEntry(w, r, s.site.index, http.StatusOK)
+}
+
+func (s *Server) servePublicRootWithoutCapability(w http.ResponseWriter, r *http.Request) {
+	if s.publicUpstream != nil {
+		clone := r.Clone(r.Context())
+		urlCopy := *r.URL
+		urlCopy.RawQuery = ""
+		clone.URL = &urlCopy
+		s.servePublicUpstream(w, clone)
+		return
+	}
+	s.serveEntry(w, r, s.site.index, http.StatusOK)
+}
+
+func (s *Server) servePublicUpstream(w http.ResponseWriter, r *http.Request) {
+	if websocket.IsWebSocketUpgrade(r) {
+		_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
+	}
+	s.publicUpstream.ServeHTTP(w, r)
+}
+
+func isTransportPath(requestPath string) bool {
+	switch requestPath {
+	case "/api/v1/session", "/api/v1/up", "/api/v1/down", "/api/v1/ws":
+		return true
+	}
+	return false
+}
+
+func sanitizedPublicFallback(r *http.Request) *http.Request {
+	clone := r.Clone(r.Context())
+	clone.Header = r.Header.Clone()
+	for _, name := range []string{
+		"Authorization",
+		"Content-Length",
+		"Content-Type",
+		"Sec-WebSocket-Key",
+		"Sec-WebSocket-Protocol",
+		"Sec-WebSocket-Version",
+		"Upgrade",
+		"X-Down-Cursor",
+		"X-Lane-ID",
+		"X-Up-Seq",
+	} {
+		clone.Header.Del(name)
+	}
+	clone.Header.Set("Connection", "close")
+	clone.Body = http.NoBody
+	clone.ContentLength = 0
+	return clone
+}
+
+func (s *Server) serveWrongHost(w http.ResponseWriter, r *http.Request) {
+	if s.site != nil {
+		s.serveEntry(w, r, s.site.notFound, http.StatusNotFound)
+		return
+	}
+	http.NotFound(w, r)
 }
 
 func (s *Server) serveReady(w http.ResponseWriter, r *http.Request) {

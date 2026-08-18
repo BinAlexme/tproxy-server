@@ -5,11 +5,13 @@ umask 077
 hostname=
 secret=
 email=
+site_dir=
+site_upstream=
 mtproxy_workers=1
 mtproxy_max_connections=4096
 
 usage() {
-	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--secret 32-or-34-hex] [--mtproxy-workers 1] [--mtproxy-max-connections 4096]" >&2
+	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--site-dir DIR | --site-upstream URL] [--secret 32-or-34-hex] [--mtproxy-workers 1] [--mtproxy-max-connections 4096]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -17,6 +19,8 @@ while [[ $# -gt 0 ]]; do
 		--hostname) hostname="${2:-}"; shift 2 ;;
 		--secret) secret="${2:-}"; shift 2 ;;
 		--email) email="${2:-}"; shift 2 ;;
+		--site-dir) site_dir="${2:-}"; shift 2 ;;
+		--site-upstream) site_upstream="${2:-}"; shift 2 ;;
 		--mtproxy-workers) mtproxy_workers="${2:-}"; shift 2 ;;
 		--mtproxy-max-connections) mtproxy_max_connections="${2:-}"; shift 2 ;;
 		*) usage; exit 2 ;;
@@ -57,6 +61,30 @@ if [[ ! "$mtproxy_max_connections" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 repository="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -n "$site_dir" ]] && [[ -n "$site_upstream" ]]; then
+	echo "--site-dir and --site-upstream are mutually exclusive" >&2
+	exit 2
+fi
+if [[ -n "$site_dir" ]]; then
+	if [[ ! -d "$site_dir" ]]; then
+		echo "site directory does not exist: $site_dir" >&2
+		exit 2
+	fi
+	site_dir="$(cd "$site_dir" && pwd -P)"
+	if [[ ! -f "$site_dir/index.html" ]] || [[ ! -r "$site_dir/index.html" ]]; then
+		echo "site directory must contain a readable regular index.html" >&2
+		exit 2
+	fi
+elif [[ -n "$site_upstream" ]]; then
+	if [[ ! "$site_upstream" =~ ^http://(127\.[0-9]+\.[0-9]+\.[0-9]+|\[::1\]):[1-9][0-9]{0,4}$ ]]; then
+		echo "site upstream must be http:// followed by a numeric loopback address and port" >&2
+		exit 2
+	fi
+elif [[ ! -f /srv/tproxy-site/index.html ]]; then
+	echo "a fresh installation requires --site-dir DIR or --site-upstream URL" >&2
+	echo "see PUBLIC_SITE.md for the site package contract" >&2
+	exit 2
+fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl nftables
@@ -121,9 +149,21 @@ chown root:root /usr/local/bin/tproxy-server
 chmod 0755 /usr/local/bin/tproxy-server
 
 install -d -o root -g root -m 0755 /srv/tproxy-site
-if [[ ! -e /srv/tproxy-site/index.html ]]; then
-	cp -a "$repository/web/public/." /srv/tproxy-site/
+if [[ -n "$site_dir" ]] && [[ ! -e /srv/tproxy-site/index.html ]]; then
+	if [[ -n "$(find /srv/tproxy-site -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+		echo "/srv/tproxy-site is not empty but has no index.html; move it aside or complete it" >&2
+		exit 1
+	fi
+	cp -a "$site_dir/." /srv/tproxy-site/
 	chown -R root:root /srv/tproxy-site
+elif [[ -n "$site_dir" ]] && [[ "$site_dir" != "$(cd /srv/tproxy-site && pwd -P)" ]]; then
+	echo "Preserving the existing /srv/tproxy-site; update it separately and restart tproxy-server"
+fi
+
+if [[ -n "$site_upstream" ]]; then
+	public_source="  \"public_upstream\": \"$site_upstream\","
+else
+	public_source='  "public_dir": "/srv/tproxy-site",'
 fi
 
 install -d -o root -g tproxy -m 0750 /etc/tproxy-server
@@ -132,7 +172,7 @@ cat > /etc/tproxy-server/config.json <<EOF
   "public_hostname": "$hostname",
   "listen": "127.0.0.1:8080",
   "admin_listen": "127.0.0.1:8081",
-  "public_dir": "/srv/tproxy-site",
+$public_source
   "profiles_file": "/run/credentials/tproxy-server.service/profiles.json"
 }
 EOF

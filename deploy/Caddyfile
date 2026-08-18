@@ -14,17 +14,14 @@
 }
 
 {$TPROXY_HOSTNAME} {
-	# One backend serves the whole surface — the static site, the bridge page
+	# One backend serves the whole surface — the operator site, the bridge page
 	# for a valid capability, and the API. Proxying every path (not just
-	# `/` and `/api/v1/*`) means a prober cannot tell relay-served paths from
-	# file_server-served paths by encoding, ETag/Last-Modified/Accept-Ranges,
-	# method handling or reverse-proxy-hop timing: there is only one hop and
-	# one code path. `encode` wraps every response identically.
+	# `/` and `/api/v1/*`) keeps one public gateway for static or delegated
+	# application responses and the transport. No file_server or separate
+	# site route exposes different encoding, range, method, or proxy behavior.
+	# `encode` wraps every response identically.
 	encode zstd gzip
 	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
-	request_body {
-		max_size 2MiB
-	}
 	reverse_proxy 127.0.0.1:8080 {
 		transport http {
 			response_header_timeout 40s

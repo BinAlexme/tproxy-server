@@ -64,6 +64,46 @@ func TestHostnameValidation(t *testing.T) {
 	}
 }
 
+func TestPublicSourceValidation(t *testing.T) {
+	value := Defaults()
+	value.PublicHostname = "proxy.example.com"
+	value.ProfilesFile = "profiles.json"
+	if err := value.validate(); err == nil {
+		t.Fatal("configuration without a public source was accepted")
+	}
+	for _, upstream := range []string{
+		"http://127.0.0.1:3000",
+		"http://[::1]:3000",
+	} {
+		value.PublicUpstream = upstream
+		if err := value.validate(); err != nil {
+			t.Fatalf("valid public upstream %q was rejected: %v", upstream, err)
+		}
+	}
+	for _, upstream := range []string{
+		"https://127.0.0.1:3000",
+		"http://localhost:3000",
+		"http://192.0.2.1:3000",
+		"http://127.0.0.1",
+		"http://127.0.0.1:3000/path",
+		"http://user@127.0.0.1:3000",
+	} {
+		value.PublicUpstream = upstream
+		if err := value.validate(); err == nil {
+			t.Fatalf("invalid public upstream %q was accepted", upstream)
+		}
+	}
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "index.html"), []byte("site"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	value.PublicDir = directory
+	value.PublicUpstream = "http://127.0.0.1:3000"
+	if err := value.validate(); err == nil {
+		t.Fatal("configuration with both public sources was accepted")
+	}
+}
+
 func TestPlainSecretMayBeginWithEE(t *testing.T) {
 	secret, err := DecodeSecret("ee0102030405060708090a0b0c0d0e0f")
 	if err != nil || len(secret) != 16 || secret[0] != 0xee {

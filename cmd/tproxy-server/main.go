@@ -30,13 +30,14 @@ func main() {
 	if err := session.ValidateBudget(value); err != nil {
 		log.Fatalf("configuration error: %v", err)
 	}
-	if *check {
-		fmt.Println("configuration is valid")
-		return
-	}
 	application, err := appserver.New(value)
 	if err != nil {
 		log.Fatalf("server initialization error: %v", err)
+	}
+	if *check {
+		application.Shutdown()
+		fmt.Println("configuration is valid")
+		return
 	}
 	publicListener, err := net.Listen("tcp", value.Listen)
 	if err != nil {
