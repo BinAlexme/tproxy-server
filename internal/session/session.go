@@ -87,6 +87,7 @@ type carrierLane struct {
 	unackedBase    uint64
 	downCursor     uint64
 	downActive     bool
+	superseded     chan struct{}
 	notify         chan struct{}
 }
 
@@ -123,6 +124,7 @@ type Session struct {
 	lastUpDigest          [sha256.Size]byte
 	upActive              bool
 	downActive            bool
+	superseded            chan struct{}
 	websocketActive       bool
 	closed                bool
 	lastActivity          time.Time
@@ -301,6 +303,17 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 	}
 	lane := s.carrierLanes[laneID]
 	if lane == nil {
+		if laneID != 0 && len(frames) != 0 && frames[0].Type != frame.Open &&
+			s.onlyLateFrames(frames) {
+			// The lane's tombstone has already been evicted (or the client
+			// remembers a close the relay no longer does): well-formed late
+			// DATA, WINDOW or CLOSE frames are ignored and acknowledged, the
+			// same as for a remembered tombstone, instead of killing the
+			// session.
+			s.lastActivity = time.Now()
+			s.mu.Unlock()
+			return sequence, nil
+		}
 		if laneID == 0 || len(frames) == 0 || frames[0].Type != frame.Open {
 			s.mu.Unlock()
 			s.protocolFailure()
@@ -385,10 +398,6 @@ func (s *Session) Poll(ctx context.Context, cursor uint64) ([]byte, uint64, erro
 		s.mu.Unlock()
 		return nil, cursor, ErrClosed
 	}
-	if s.downActive {
-		s.mu.Unlock()
-		return nil, cursor, ErrConcurrent
-	}
 	s.lastActivity = time.Now()
 	if len(s.unacked) != 0 {
 		if cursor == s.unackedBase {
@@ -411,8 +420,22 @@ func (s *Session) Poll(ctx context.Context, cursor uint64) ([]byte, uint64, erro
 		s.protocolFailure()
 		return nil, cursor, ErrProtocol
 	}
+	// Newest poll wins: a poll arriving while another one is parked (its
+	// connection most likely died silently) takes over, and the older waiter
+	// returns an empty batch with its own cursor — harmless if that
+	// connection is still alive, unobserved if it is dead — instead of the
+	// newer poll being refused.
+	if s.downActive && s.superseded != nil {
+		close(s.superseded)
+	}
+	mine := make(chan struct{})
+	s.superseded = mine
 	s.downActive = true
 	for {
+		if s.superseded != mine {
+			s.mu.Unlock()
+			return nil, cursor, nil
+		}
 		if len(s.pendingFrames) != 0 {
 			batch := s.takeDownBatchLocked()
 			s.downCursor++
@@ -421,6 +444,7 @@ func (s *Session) Poll(ctx context.Context, cursor uint64) ([]byte, uint64, erro
 			s.unackedCost = batch.cost
 			s.unackedItems = batch.items
 			s.downActive = false
+			s.superseded = nil
 			next := s.downCursor
 			s.mu.Unlock()
 			if s.onDown != nil {
@@ -430,6 +454,7 @@ func (s *Session) Poll(ctx context.Context, cursor uint64) ([]byte, uint64, erro
 		}
 		if s.closed {
 			s.downActive = false
+			s.superseded = nil
 			s.mu.Unlock()
 			return nil, cursor, ErrClosed
 		}
@@ -437,20 +462,38 @@ func (s *Session) Poll(ctx context.Context, cursor uint64) ([]byte, uint64, erro
 		select {
 		case <-ctx.Done():
 			s.mu.Lock()
-			s.downActive = false
+			if s.superseded == mine {
+				s.downActive = false
+				s.superseded = nil
+			}
 			s.mu.Unlock()
 			return nil, cursor, ctx.Err()
+		case <-mine:
+			s.mu.Lock()
+			signal(s.notify)
+			s.mu.Unlock()
+			return nil, cursor, nil
 		case <-deadline.C:
 			s.mu.Lock()
+			if s.superseded != mine {
+				signal(s.notify)
+				s.mu.Unlock()
+				return nil, cursor, nil
+			}
 			if len(s.pendingFrames) != 0 {
 				continue
 			}
 			s.downActive = false
+			s.superseded = nil
 			s.lastActivity = time.Now()
 			s.mu.Unlock()
 			return nil, cursor, nil
 		case <-s.notify:
 			s.mu.Lock()
+			if s.superseded != mine {
+				// This wake-up belonged to the poll that took over.
+				signal(s.notify)
+			}
 		}
 	}
 }
@@ -471,10 +514,6 @@ func (s *Session) PollLane(ctx context.Context, laneID uint32, cursor uint64) ([
 	if lane == nil {
 		s.mu.Unlock()
 		return nil, cursor, false, ErrProtocol
-	}
-	if lane.downActive {
-		s.mu.Unlock()
-		return nil, cursor, false, ErrConcurrent
 	}
 	s.lastActivity = time.Now()
 	if len(lane.unacked) != 0 {
@@ -498,8 +537,17 @@ func (s *Session) PollLane(ctx context.Context, laneID uint32, cursor uint64) ([
 		s.protocolFailure()
 		return nil, cursor, false, ErrProtocol
 	}
+	if lane.downActive && lane.superseded != nil {
+		close(lane.superseded)
+	}
+	mine := make(chan struct{})
+	lane.superseded = mine
 	lane.downActive = true
 	for {
+		if lane.superseded != mine {
+			s.mu.Unlock()
+			return nil, cursor, false, nil
+		}
 		if len(lane.pendingFrames) != 0 {
 			batch := s.takeLaneDownBatchLocked(lane)
 			lane.downCursor++
@@ -508,6 +556,7 @@ func (s *Session) PollLane(ctx context.Context, laneID uint32, cursor uint64) ([
 			lane.unackedCost = batch.cost
 			lane.unackedItems = batch.items
 			lane.downActive = false
+			lane.superseded = nil
 			next := lane.downCursor
 			s.mu.Unlock()
 			if s.onDown != nil {
@@ -517,6 +566,7 @@ func (s *Session) PollLane(ctx context.Context, laneID uint32, cursor uint64) ([
 		}
 		if s.closed {
 			lane.downActive = false
+			lane.superseded = nil
 			s.mu.Unlock()
 			return nil, cursor, false, ErrClosed
 		}
@@ -525,28 +575,60 @@ func (s *Session) PollLane(ctx context.Context, laneID uint32, cursor uint64) ([
 			_, closed := s.closedStreams[laneID]
 			if !live && closed {
 				lane.downActive = false
+				lane.superseded = nil
 				s.mu.Unlock()
 				return nil, cursor, true, nil
 			}
+		}
+		if s.carrierLanes[laneID] != lane {
+			lane.downActive = false
+			lane.superseded = nil
+			s.mu.Unlock()
+			return nil, cursor, true, nil
 		}
 		s.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			s.mu.Lock()
-			lane.downActive = false
+			if lane.superseded == mine {
+				lane.downActive = false
+				lane.superseded = nil
+			}
 			s.mu.Unlock()
 			return nil, cursor, false, ctx.Err()
+		case <-mine:
+			s.mu.Lock()
+			signal(lane.notify)
+			s.mu.Unlock()
+			return nil, cursor, false, nil
+		case <-s.done:
+			s.mu.Lock()
+			if lane.superseded == mine {
+				lane.downActive = false
+				lane.superseded = nil
+			}
+			s.mu.Unlock()
+			return nil, cursor, false, ErrClosed
 		case <-deadline.C:
 			s.mu.Lock()
+			if lane.superseded != mine {
+				signal(lane.notify)
+				s.mu.Unlock()
+				return nil, cursor, false, nil
+			}
 			if len(lane.pendingFrames) != 0 {
 				continue
 			}
 			lane.downActive = false
+			lane.superseded = nil
 			s.lastActivity = time.Now()
 			s.mu.Unlock()
 			return nil, cursor, false, nil
 		case <-lane.notify:
 			s.mu.Lock()
+			if lane.superseded != mine {
+				signal(lane.notify)
+			}
 		}
 	}
 }
@@ -565,6 +647,17 @@ func (s *Session) Close() {
 
 func (s *Session) wait() {
 	s.backendWG.Wait()
+}
+
+func (s *Session) onlyLateFrames(values []frame.Frame) bool {
+	for _, value := range values {
+		switch value.Type {
+		case frame.Data, frame.Window, frame.Close:
+		default:
+			return false
+		}
+	}
+	return len(values) != 0
 }
 
 func (s *Session) validateBatchLocked(values []frame.Frame) bool {
@@ -999,6 +1092,21 @@ func (s *Session) queueLaneFrameLocked(t frame.Type, id uint32, payload []byte) 
 	return true
 }
 
+// ValidateBudget rejects a configuration whose per-session control reserve,
+// multiplied across every session, would leave the global data budget at zero
+// (bytes or items) — a silent footgun that would starve every data frame.
+func ValidateBudget(cfg config.Config) error {
+	reserveCost, reserveItems := pendingControlReserve(cfg.Limits)
+	sessions := cfg.Limits.MaxSessionsGlobal
+	if reserveCost > cfg.Limits.MaxPendingGlobal/sessions {
+		return errors.New("per-session control reserve times max_sessions_global exhausts max_pending_global")
+	}
+	if reserveItems > cfg.Limits.MaxPendingItemsGlobal/sessions {
+		return errors.New("per-session control reserve times max_sessions_global exhausts max_pending_items_global")
+	}
+	return nil
+}
+
 func pendingControlReserve(limits config.Limits) (int, int) {
 	items := controlReserveExtraItems
 	if limits.MaxStreamsPerSession > (math.MaxInt-items)/controlReserveItemsPerStream {
@@ -1168,13 +1276,38 @@ func (s *Session) rememberClosedLocked(id uint32) {
 	} else {
 		old := s.closedOrder[s.closedStart]
 		delete(s.closedStreams, old)
-		delete(s.carrierLanes, old)
+		if lane := s.carrierLanes[old]; lane != nil {
+			s.releaseLaneLocked(lane)
+			delete(s.carrierLanes, old)
+		}
 		s.closedOrder[s.closedStart] = id
 		s.closedStart = (s.closedStart + 1) % len(s.closedOrder)
 	}
 	if lane := s.carrierLanes[id]; lane != nil {
 		signal(lane.notify)
 	}
+}
+
+// releaseLaneLocked returns an evicted lane's still-charged pending and
+// unacked budget to the session and global pools and wakes any parked poller
+// so it observes the eviction instead of blocking until its deadline. Late
+// frames for the tombstoned id are then no-ops per PROTOCOL.md.
+func (s *Session) releaseLaneLocked(lane *carrierLane) {
+	cost := lane.unackedCost
+	items := lane.unackedItems
+	for i := range lane.pendingFrames {
+		cost += lane.pendingFrames[i].cost
+		items++
+	}
+	if cost != 0 || items != 0 {
+		s.releasePendingLocked(cost, items)
+	}
+	lane.pendingFrames = nil
+	lane.pendingWindows = nil
+	lane.unacked = nil
+	lane.unackedCost = 0
+	lane.unackedItems = 0
+	signal(lane.notify)
 }
 
 func (s *Session) releaseStreamWritesLocked(state *streamState) {
@@ -1379,4 +1512,12 @@ func (s *backendStream) close() {
 		}
 		s.connMu.Unlock()
 	})
+}
+
+// SetUpActiveForTest forces the single-uplink-in-flight flag so tests can
+// exercise the concurrent-uplink path without a real race.
+func (s *Session) SetUpActiveForTest(active bool) {
+	s.mu.Lock()
+	s.upActive = active
+	s.mu.Unlock()
 }

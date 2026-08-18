@@ -29,7 +29,7 @@ if [[ ! -x "$source_directory/objs/bin/mtproto-proxy" ]] ||
 	trap 'rm -rf "$temporary"' EXIT
 	archive="$temporary/MTProxy.tar.gz"
 	build_directory="$temporary/MTProxy"
-	curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+	curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
 		--output "$archive" \
 		"https://github.com/TelegramMessenger/MTProxy/archive/${mtproxy_commit}.tar.gz"
 	test "$(sha256sum "$archive" | awk '{print $1}')" = "$mtproxy_checksum"
@@ -52,9 +52,9 @@ install -d -o root -g mtproxy -m 0750 /etc/mtproxy
 secret_temp="$(mktemp /etc/mtproxy/proxy-secret.XXXXXX)"
 config_temp="$(mktemp /etc/mtproxy/proxy-multi.conf.XXXXXX)"
 trap 'rm -f "$secret_temp" "$config_temp"' EXIT
-curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
 	--output "$secret_temp" https://core.telegram.org/getProxySecret
-curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
 	--output "$config_temp" https://core.telegram.org/getProxyConfig
 test "$(wc -c < "$secret_temp")" -eq 128
 test "$(wc -c < "$config_temp")" -ge 100

@@ -470,23 +470,60 @@ func TestQueuedFramesChargeOverheadAndLimitBatchCount(t *testing.T) {
 	session.Close()
 }
 
-func TestConcurrentCarriersAreRejected(t *testing.T) {
+func TestConcurrentUplinkIsRejectedAndNewestPollWins(t *testing.T) {
 	manager, _, value := testSession(t)
 	defer manager.Shutdown()
-	ctx, cancel := context.WithCancel(context.Background())
-	first := make(chan error, 1)
+
+	type pollResult struct {
+		body   []byte
+		cursor uint64
+		err    error
+	}
+	first := make(chan pollResult, 1)
 	go func() {
-		_, _, err := value.Poll(ctx, 0)
-		first <- err
+		body, cursor, err := value.Poll(context.Background(), 0)
+		first <- pollResult{body, cursor, err}
 	}()
 	waitFor(t, func() bool {
 		value.mu.Lock()
 		defer value.mu.Unlock()
 		return value.downActive
 	})
-	if _, _, err := value.Poll(context.Background(), 0); !errors.Is(err, ErrConcurrent) {
-		t.Fatalf("concurrent downlink was accepted: %v", err)
+
+	second := make(chan pollResult, 1)
+	go func() {
+		body, cursor, err := value.Poll(context.Background(), 0)
+		second <- pollResult{body, cursor, err}
+	}()
+	select {
+	case result := <-first:
+		if result.err != nil || len(result.body) != 0 || result.cursor != 0 {
+			t.Fatalf("superseded poll did not return an empty batch with its cursor: %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("superseded poll was not released by the newer poll")
 	}
+	value.mu.Lock()
+	queued := value.queueFrameLocked(frame.Window, 1, frame.WindowPayload(2))
+	value.mu.Unlock()
+	if !queued {
+		t.Fatal("could not queue a downlink frame")
+	}
+	select {
+	case result := <-second:
+		if result.err != nil || len(result.body) == 0 || result.cursor != 1 {
+			t.Fatalf("newest poll did not receive the downlink: %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("newest poll did not observe the queued frame")
+	}
+	value.mu.Lock()
+	closed := value.closed
+	value.mu.Unlock()
+	if closed {
+		t.Fatal("a superseded poll closed the session")
+	}
+
 	value.mu.Lock()
 	value.upActive = true
 	value.mu.Unlock()
@@ -496,10 +533,6 @@ func TestConcurrentCarriersAreRejected(t *testing.T) {
 	value.mu.Lock()
 	value.upActive = false
 	value.mu.Unlock()
-	cancel()
-	if err := <-first; !errors.Is(err, context.Canceled) {
-		t.Fatalf("first downlink did not stop on cancellation: %v", err)
-	}
 }
 
 func TestSessionCloseStopsBackendGoroutines(t *testing.T) {
@@ -930,5 +963,101 @@ func waitFor(t *testing.T, condition func() bool) {
 			t.Fatal("condition was not reached")
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestEvictedLaneReleasesBudgetAndIgnoresLateFrames(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierHTTPSLanes
+	configuration.Limits.MaxClosedStreamIDs = 4
+	manager := NewManager(configuration)
+	defer manager.Shutdown()
+	bootstrap, err := manager.IssueBootstrap(
+		&configuration.Profiles[0],
+		"198.51.100.9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := manager.Create(
+		bootstrap,
+		"198.51.100.9",
+		frame.Encode(frame.Hello, 0, []byte{1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := created.Session
+
+	// Open more lanes than the tombstone capacity without ever polling them,
+	// so each lane keeps its queued CLOSE (the backend refuses to dial) and
+	// its budget charge until it is evicted.
+	total := uint32(configuration.Limits.MaxClosedStreamIDs + 3)
+	for id := uint32(1); id <= total; id++ {
+		if _, err := value.ProcessUpLane(id, 1, frame.Encode(frame.Open, id, nil)); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, func() bool {
+			value.mu.Lock()
+			defer value.mu.Unlock()
+			_, live := value.streams[id]
+			_, closed := value.closedStreams[id]
+			return !live && (closed || value.carrierLanes[id] == nil)
+		})
+	}
+	value.mu.Lock()
+	evictedLanes := 0
+	for id := uint32(1); id <= total; id++ {
+		if value.carrierLanes[id] == nil {
+			evictedLanes++
+		}
+	}
+	value.mu.Unlock()
+	if evictedLanes == 0 {
+		t.Fatal("no lane was evicted")
+	}
+
+	// Drain every surviving lane; afterwards nothing may remain charged even
+	// though the evicted lanes were never polled.
+	for id := uint32(1); id <= total; id++ {
+		value.mu.Lock()
+		lane := value.carrierLanes[id]
+		value.mu.Unlock()
+		if lane == nil {
+			continue
+		}
+		cursor := uint64(0)
+		for {
+			body, next, closed, err := value.PollLane(context.Background(), id, cursor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if closed {
+				break
+			}
+			if len(body) == 0 {
+				t.Fatalf("lane %d returned an empty batch before closing", id)
+			}
+			cursor = next
+		}
+	}
+	value.mu.Lock()
+	pendingCost, pendingItems := value.pendingCost, value.pendingItems
+	value.mu.Unlock()
+	if pendingCost != 0 || pendingItems != 0 {
+		t.Fatalf("session budget leaked after lane eviction: cost=%d items=%d", pendingCost, pendingItems)
+	}
+	capacity := manager.Capacity()
+	if capacity.PendingBytes != 0 || capacity.PendingItems != 0 {
+		t.Fatalf("global budget leaked after lane eviction: bytes=%d items=%d", capacity.PendingBytes, capacity.PendingItems)
+	}
+
+	late := frame.Encode(frame.Data, 1, []byte("late"))
+	if ack, err := value.ProcessUpLane(1, 7, late); err != nil || ack != 7 {
+		t.Fatalf("late DATA for an evicted lane was not ignored: ack=%d error=%v", ack, err)
+	}
+	value.mu.Lock()
+	closed := value.closed
+	value.mu.Unlock()
+	if closed {
+		t.Fatal("late DATA for an evicted lane closed the session")
 	}
 }

@@ -7,7 +7,6 @@ Type=oneshot
 ExecStart=/usr/local/sbin/refresh-mtproxy-config
 ProtectProc=invisible
 ProcSubset=pid
-ExecStart=/bin/systemctl try-restart mtproxy.service
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true

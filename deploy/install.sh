@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 hostname=
 secret=
@@ -65,7 +66,7 @@ caddy_checksum=8220d1f013b6f27510247b2360c9e0ca9f018feebd82515f07635318b34ff9777
 caddy_archive="$(mktemp /tmp/caddy-linux-amd64.XXXXXX.tar.gz)"
 caddy_directory="$(mktemp -d /tmp/caddy-linux-amd64.XXXXXX)"
 trap 'rm -f "$caddy_archive"; rm -rf "$caddy_directory"' EXIT
-curl --fail --silent --show-error --location \
+curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
 	--output "$caddy_archive" "https://github.com/caddyserver/caddy/releases/download/v${caddy_version}/caddy_${caddy_version}_linux_amd64.tar.gz"
 test "$(sha512sum "$caddy_archive" | awk '{print $1}')" = "$caddy_checksum"
 tar -C "$caddy_directory" -xzf "$caddy_archive"
@@ -99,7 +100,7 @@ if [[ -z "$go_binary" ]]; then
 	go_archive="$(mktemp /tmp/go-linux-amd64.XXXXXX.tar.gz)"
 	go_directory="$(mktemp -d /tmp/go-linux-amd64.XXXXXX)"
 	trap 'rm -f "$go_archive"; rm -rf "$go_directory"' EXIT
-	curl --fail --silent --show-error --location \
+	curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
 		--output "$go_archive" "https://go.dev/dl/go${go_version}.linux-amd64.tar.gz"
 	test "$(sha256sum "$go_archive" | awk '{print $1}')" = "$go_checksum"
 	tar -C "$go_directory" -xzf "$go_archive"

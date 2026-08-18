@@ -33,7 +33,7 @@
   "timeouts": {
     "backend_dial": "5s",
     "long_poll": "25s",
-    "reconnect_grace": "10m",
+    "reconnect_grace": "2m",
     "bootstrap_lifetime": "2m",
     "read_header": "10s",
     "idle": "75s",

@@ -3,8 +3,10 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCapabilityVectors(t *testing.T) {
@@ -192,5 +194,36 @@ func TestLoadAcceptsSystemdCredentialReadPermissions(t *testing.T) {
 	t.Setenv("CREDENTIALS_DIRECTORY", "")
 	if _, err := Load(path); err == nil {
 		t.Fatal("group/other-readable profiles file outside a credential directory was accepted")
+	}
+}
+
+func TestCarrierBatchMustFitDesktopLoopbackCap(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "index.html"), []byte("index"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	profiles := filepath.Join(directory, "profiles.json")
+	if err := os.WriteFile(profiles, []byte(`{"profiles":[{"name":"a","secret":"000102030405060708090a0b0c0d0e0f","backend":"127.0.0.1:443"}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	write := func(batch, body int) string {
+		path := filepath.Join(directory, "config.json")
+		content := `{"public_hostname":"proxy.example.com","public_dir":"` + directory + `","profiles_file":"` + profiles + `","limits":{"carrier_batch_bytes":` + strconv.Itoa(batch) + `,"max_body_bytes":` + strconv.Itoa(body) + `}}`
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	if _, err := Load(write(3*1024*1024, 4*1024*1024)); err == nil {
+		t.Fatal("accepted carrier_batch_bytes above 2 MiB")
+	}
+	if _, err := Load(write(2*1024*1024, 4*1024*1024)); err != nil {
+		t.Fatalf("rejected a 2 MiB carrier batch: %v", err)
+	}
+}
+
+func TestDefaultReconnectGraceIsShort(t *testing.T) {
+	if Defaults().Timeouts.ReconnectGrace.Value() != 2*time.Minute {
+		t.Fatal("reconnect_grace default is not 2m")
 	}
 }

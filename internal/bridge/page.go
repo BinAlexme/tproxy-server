@@ -7,6 +7,8 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+
+	"github.com/telegramdesktop/tproxy-server/internal/config"
 )
 
 type Page struct {
@@ -18,8 +20,11 @@ type Page struct {
 const PermissionsPolicy = "accelerometer=(), autoplay=(), camera=(), clipboard-read=(), clipboard-write=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), hid=(), idle-detection=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-create=(), publickey-credentials-get=(), screen-wake-lock=(), serial=(), usb=(), web-share=(), xr-spatial-tracking=()"
 
 func Render(hostname, bootstrapToken, carrierMode string, batchBytes int) (Page, error) {
-	if batchBytes <= 0 {
-		return Page{}, errors.New("carrier batch size must be positive")
+	if err := config.ValidateHostname(hostname); err != nil {
+		return Page{}, err
+	}
+	if batchBytes <= 0 || batchBytes > config.MaxCarrierBatchBytes {
+		return Page{}, errors.New("carrier batch size out of range")
 	}
 	if carrierMode != "https" && carrierMode != "https-lanes" && carrierMode != "websocket" {
 		return Page{}, errors.New("invalid carrier mode")
@@ -114,38 +119,77 @@ function splitFrames(value){
  if(!result.length)throw new Error('empty frame batch');
  return result;
 }
-function joinPending(values){
- let total=0,count=0;
- while(count<values.length&&(count===0||total+values[count].byteLength<=batchLimit)){total+=values[count].byteLength;count++}
+function frameBound(value,maxFrames,maxBytes){
+ const view=new DataView(value);let offset=0,frames=0;
+ while(offset<value.byteLength){
+  if(value.byteLength-offset<8)throw new Error('invalid frame batch');
+  const size=view.getUint32(offset+4),end=offset+8+size;
+  if(end>value.byteLength)throw new Error('invalid frame');
+  if(frames>0&&(frames>=maxFrames||end>maxBytes))break;
+  frames++;offset=end;
+ }
+ return {frames,bytes:offset};
+}
+function joinPending(values,lane){
+ // The relay rejects a body with more than 4096 frames or more than
+ // batchLimit bytes, so never let a single request carry more than that:
+ // pack whole queued items until the next one would overflow, and split a
+ // first item that on its own exceeds either bound at a frame boundary,
+ // pushing the remainder back to the front of the queue as its own item.
+ let total=0,count=0,frames=0;
+ while(count<values.length){
+  const bound=frameBound(values[count],4096,batchLimit);
+  const whole=bound.bytes===values[count].byteLength;
+  if(count===0&&!whole){
+   const head=new Uint8Array(values[0],0,bound.bytes).slice();
+   values[0]=values[0].slice(bound.bytes);
+   queuedItems++;if(lane)lane.items++;
+   return {body:head.buffer,total:bound.bytes,count:1};
+  }
+  if(count!==0&&(total+values[count].byteLength>batchLimit||frames+bound.frames>4096))break;
+  total+=values[count].byteLength;frames+=bound.frames;count++;
+ }
  const joined=new Uint8Array(total);let offset=0;
  for(const data of values.splice(0,count)){joined.set(new Uint8Array(data),offset);offset+=data.byteLength}
  return {body:joined.buffer,total,count};
 }
+function retryAfterMs(response){
+ const header=response.headers.get('Retry-After');
+ if(!header)return 0;
+ const seconds=Number(header);
+ if(Number.isFinite(seconds)&&seconds>=0)return Math.min(seconds*1000,30000);
+ const when=Date.parse(header);
+ if(Number.isFinite(when)){const delta=when-Date.now();return delta>0?Math.min(delta,30000):0}
+ return 0;
+}
 async function request(path,makeOptions){
- let delay=250;
- for(let attempt=0;attempt!==9;attempt++){
+ let delay=250,attempt=0;const deadline=Date.now()+90000;
+ while(true){
   const requestOptions=makeOptions(),controller=new AbortController();
   const external=requestOptions.signal,abort=()=>controller.abort();
   if(external)external.addEventListener('abort',abort,{once:true});
   requestOptions.signal=controller.signal;
   const timer=setTimeout(abort,90000);
+  let wait=0,serviceUnavailable=false;
   try{
    const response=await fetch(relayOrigin+path,requestOptions);
-   if(response.status<500)return response;
+   if(response.status!==503)return response;
+   serviceUnavailable=true;wait=retryAfterMs(response);
    await response.arrayBuffer();
-  }catch(error){if(closed||(external&&external.aborted))throw error}
+  }catch(error){if(closed||(external&&external.aborted))throw error;attempt++;if(attempt===9)throw new Error('carrier retry limit reached')}
   finally{clearTimeout(timer);if(external)external.removeEventListener('abort',abort)}
+  if(serviceUnavailable&&Date.now()>=deadline)throw new Error('carrier retry limit reached');
   status('reconnecting');
-  await pause(delay+Math.floor(Math.random()*Math.max(1,delay/4)));
-  delay=Math.min(delay*2,5000);
+  const backoff=wait||(delay+Math.floor(Math.random()*Math.max(1,delay/4)));
+  await pause(backoff);
+  if(!serviceUnavailable)delay=Math.min(delay*2,5000);
  }
- throw new Error('carrier retry limit reached');
 }
 function fail(){
  if(closed)return;
  status('failed');
  if(port)port.postMessage({t:'close'});
- close(false);
+ close(true);
 }
 async function createSession(first){
  try{
@@ -155,9 +199,10 @@ async function createSession(first){
   sessionToken=response.headers.get('X-Session-Token')||'';
   downCursor=response.headers.get('X-Down-Cursor')||'0';
   if(!sessionToken)throw new Error('missing session token');
+  if(closed){fetch(relayOrigin+'/api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}
   const welcome=await response.arrayBuffer();
   if(carrierMode==='websocket')await openWebSocket();
-  if(closed)return;
+  if(closed){fetch(relayOrigin+'/api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}
   port.postMessage(welcome,[welcome]);
   status('connected');
   for(const data of pending.splice(0)){release(data.byteLength,1,null);queueCarrier(data)}
@@ -181,7 +226,7 @@ async function runUp(){
  upRunning=true;
  try{
   while(!closed&&sessionToken&&upPending.length){
-   const batch=joinPending(upPending),sequence=String(upSequence);
+   const batch=joinPending(upPending,null),sequence=String(upSequence);
    const response=await request('/api/v1/up',()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence}));
    if(response.status!==204||response.headers.get('X-Up-Ack')!==sequence)throw new Error('uplink rejected');
    release(batch.total,batch.count,null);port.postMessage({t:'traffic',up:batch.total,down:0});upSequence++;
@@ -215,10 +260,8 @@ function rememberLaneClosed(id){
 }
 function queueLane(value){
  let lane=lanes.get(value.id);
- if(!lane&&closedLanes.has(value.id)){
-  if(value.type===2||value.type===3||value.type===4)return;
-  throw new Error('closed lane was reused');
- }
+ if(!lane&&(value.type===2||value.type===3||value.type===4))return;
+ if(!lane&&closedLanes.has(value.id))throw new Error('closed lane was reused');
  if(!lane&&value.type!==1)throw new Error('lane did not begin with OPEN');
  lane=lane||ensureLane(value.id);
  if(!reserve(value.data,lane)){fail();return}
@@ -229,7 +272,7 @@ async function runLaneUp(lane){
  lane.running=true;
  try{
   while(!closed&&sessionToken&&lane.pending.length){
-   const batch=joinPending(lane.pending),sequence=String(lane.sequence),laneID=String(lane.id);
+   const batch=joinPending(lane.pending,lane),sequence=String(lane.sequence),laneID=String(lane.id);
    const response=await request('/api/v1/up',()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence,'X-Lane-ID':laneID}));
    if(response.status!==204||response.headers.get('X-Up-Ack')!==sequence)throw new Error('lane uplink rejected');
    release(batch.total,batch.count,lane);port.postMessage({t:'traffic',up:batch.total,down:0});lane.sequence++;
@@ -284,7 +327,7 @@ function runWebSocketUp(){
   return;
  }
  try{
-  const batch=joinPending(upPending);webSocket.send(batch.body);release(batch.total,batch.count,null);
+  const batch=joinPending(upPending,null);webSocket.send(batch.body);release(batch.total,batch.count,null);
   port.postMessage({t:'traffic',up:batch.total,down:0});
   if(upPending.length)queueMicrotask(runWebSocketUp);
  }catch(error){fail()}

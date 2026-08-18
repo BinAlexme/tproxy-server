@@ -57,14 +57,23 @@ remaining proof-of-concept work.
 The reference deployment layout is:
 
 ```text
-Internet :80/:443 -> Caddy -> static website
-                         \-> 127.0.0.1:8080 tproxy-server
-                                             \-> 127.0.0.1:2398 official MTProxy
+Internet :80/:443 -> Caddy -> 127.0.0.1:8080 tproxy-server -> static website (from memory)
+                                              \-> 127.0.0.1:2398 official MTProxy
 ```
 
 Only Caddy listens on external interfaces. The relay, its admin endpoints, the
 official MTProxy client port, and MTProxy statistics remain local. The relay never
 receives a client-selected backend address and never decrypts the MTProxy stream.
+
+Caddy proxies **every** path to the relay, and the relay serves the whole public
+site from memory (loaded from `public_dir` at start-up) through one code path with
+one header set. A prober without a valid capability therefore cannot distinguish
+this host from the same static site: `/`, `/?anything`, unauthenticated
+`/api/v1/*`, and any other miss produce byte-, header- and timing-identical
+responses per method, the capability scan runs in constant time on every `GET /`,
+and only `GET /?bridge=<valid capability>` differs. Restart the relay
+(`sudo systemctl restart tproxy-server`) after changing files under `public_dir`;
+the site is read once at start-up.
 
 ## What you need
 
@@ -89,8 +98,13 @@ proxy.example.com -> YOUR_SERVER_PUBLIC_IPV4
 ```
 
 Add an `AAAA` record only when the server really has working public IPv6. Do not put
-a CDN or HTTP proxy in front of this first deployment. Wait until the record resolves
-from outside your network:
+a CDN or HTTP proxy in front of this first deployment. Publish the hostname to
+users in its ACE (`xn--…`) form if it is an internationalised name: the desktop
+client stores and derives the capability from the A-label, ACE input round-trips
+unchanged on every platform, while a hand-typed Unicode host containing `ß`, `ς`,
+ZWJ/ZWNJ, or characters newer than Unicode 3.2 can be mapped differently by the
+Qt 5.15 (Windows) and Qt 6 (macOS/Linux) desktop builds and then derive a
+different capability. Wait until the record resolves from outside your network:
 
 ```bash
 dig +short A proxy.example.com
@@ -302,22 +316,30 @@ systemd `LoadCredential`, point `profiles_file` directly at the mode-restricted 
 Both relay listeners and every backend address must be numeric loopback addresses.
 
 Build the official backend with `deploy/install-mtproxy.sh`, install the supplied
-systemd units, and add these routes before your existing static-site route:
+systemd units, and let the relay serve the whole hostname:
 
 ```caddyfile
-@tproxy_relay path / /api/v1/*
-handle @tproxy_relay {
-  reverse_proxy 127.0.0.1:8080 {
-    transport http {
-      response_header_timeout 40s
-    }
+encode zstd gzip
+reverse_proxy 127.0.0.1:8080 {
+  transport http {
+    response_header_timeout 40s
   }
 }
 ```
 
+Do not keep a separate `file_server` for the statics on this hostname: the relay
+serves them from `public_dir` so that relay-served and file-served paths cannot be
+told apart (encoding, `ETag`/`Last-Modified`/`Accept-Ranges`, method handling, or
+an extra reverse-proxy hop are all probing tells). Set the server `timeouts` as in
+`deploy/Caddyfile` (`read_body` well above `long_poll`).
+
 The relay must receive the original `Host`. The supplied direct-to-origin Caddy
 layout relies on Caddy's default sanitizing of forwarded client addresses; if you
-change trusted-proxy handling, the relay must still receive exactly one IP address.
+change trusted-proxy handling, the relay must still receive exactly one IP address
+in `X-Forwarded-For` — the relay binds each bootstrap to that address and rejects
+a request that carries a list or an unparsable value. A dual-stack client that
+switches address family between loading the bridge and creating the session sees
+one 404 and simply retries.
 Do not apply your public site's
 `X-Frame-Options`, COOP, COEP, or framing CSP to the proxied root response; the
 bridge supplies a distinct CSP permitting only the numeric loopback parent.
@@ -406,14 +428,37 @@ those optional hard limits. This is deliberate: many legitimate users may share 
 carrier-grade NAT address. Set a positive value only when the deployment needs a
 secondary source-address abuse boundary; it does not replace the global limits.
 
+The relay refuses to start when the per-session control reserve, multiplied by
+`max_sessions_global`, would leave `max_pending_global` or
+`max_pending_items_global` with no room for data. `carrier_batch_bytes` may not
+exceed 2 MiB, the desktop client's loopback-fallback message cap.
+
+`timeouts.reconnect_grace` (default `2m`) is how long a session whose client has
+stopped reaching the relay entirely stays resumable. An alive bridge refreshes the
+session on every long poll, so it only matters after a total silence; the bridge's
+own retry window fits under two minutes, and the desktop MTProto layer has already
+reset its connections after ~30–45 s of silence, so a longer grace mostly pins
+session slots for clients that will start a fresh session anyway. Raise it if
+resume-over-slots is preferred (for example for mobile clients that background for
+minutes). A failing bridge and a session created after the page closed both delete
+their session promptly, so orphaned slots are bounded by this value.
+
+Deployments that still serve Linux desktop proof-of-concept clients built before
+the 2 MiB WebView message cap should set `limits.max_frame_payload` to `524288`
+(512 KiB): that bounds both DATA coalescing and per-frame size so no native message
+exceeds the older helper's 1 MiB cap; the throughput cost is negligible and the
+default can be restored once those clients are updated.
+
 Every `limits` value in a profile is optional. An omitted value inherits the
 corresponding global value, so the default single profile adds no second quota.
 Profile values may only lower the global ceiling. With several secrets, the global
 buckets protect the whole process and each profile's session and stream buckets
 prevent one secret from consuming more than its configured share. A stream rejected
 by a capacity or creation-rate limit receives `CLOSE`; other streams and the parent
-session remain active. Authenticated session creation overload returns HTTP 503 with
-`Retry-After` so the bridge can retry safely.
+session remain active. Authenticated session creation overload, a temporarily full
+uplink queue, and an uplink retry racing an in-flight parse all return HTTP 503 with
+`Retry-After` so the bridge can retry safely; a downlink poll arriving while another
+is parked simply supersedes it.
 
 Official MTProxy has a separate process-level boundary. Its systemd service reads
 `MTPROXY_WORKERS` and `MTPROXY_MAX_CONNECTIONS` from
@@ -452,10 +497,20 @@ MTProxy accepts its secret through `-S`, which leaves the value in that process'
 argument memory. Root and unrestricted host administrators can still inspect it;
 do not give untrusted users login or unconfined service access to this host.
 
-The refresh timer replaces `proxy-multi.conf` daily and restarts MTProxy so the new
-routing data is active. Existing backend streams reconnect through the still-live
-relay session. The public website remains available when either backend process is
-down; `/readyz` reports the backend outage.
+The refresh timer fetches `proxy-multi.conf` daily and restarts MTProxy only when
+the routing data actually changed. Existing backend streams reconnect through the
+still-live relay session. The public website remains available when either
+backend process is down; `/readyz` reports the backend outage.
+
+`tproxy-firewall.service` is ordered after and bound to `nftables.service`, so a
+distribution `nftables` start/reload (whose default `/etc/nftables.conf` begins
+with `flush ruleset`) re-applies the `inet tproxy_backend` table instead of
+silently leaving MTProxy's `0.0.0.0` listener exposed. The hosting provider's
+firewall from step 3 remains the first boundary; this unit is the second.
+
+Never enable access logging of raw URIs, request headers, or bodies on Caddy or
+the relay: the bridge URL carries the derived capability, and the WebSocket
+carrier's session bearer travels in `Sec-WebSocket-Protocol`.
 
 For a relay-code update, upload the new repository and run from its root:
 

@@ -14,6 +14,7 @@ import (
 
 	"github.com/telegramdesktop/tproxy-server/internal/config"
 	appserver "github.com/telegramdesktop/tproxy-server/internal/server"
+	"github.com/telegramdesktop/tproxy-server/internal/session"
 )
 
 func main() {
@@ -24,6 +25,9 @@ func main() {
 
 	value, err := config.Load(*configPath, *profilesPath)
 	if err != nil {
+		log.Fatalf("configuration error: %v", err)
+	}
+	if err := session.ValidateBudget(value); err != nil {
 		log.Fatalf("configuration error: %v", err)
 	}
 	if *check {
@@ -44,9 +48,17 @@ func main() {
 		log.Fatalf("admin listener error: %v", err)
 	}
 
+	// ReadTimeout covers the whole request including a slow body; it must stay
+	// well above long_poll because the server's background read would
+	// otherwise cancel every parked long poll's context.
+	readTimeout := 60 * time.Second
+	if minimum := 2 * value.Timeouts.LongPoll.Value(); minimum > readTimeout {
+		readTimeout = minimum
+	}
 	publicHTTP := &http.Server{
 		Handler:           application.Handler(),
 		ReadHeaderTimeout: value.Timeouts.ReadHeader.Value(),
+		ReadTimeout:       readTimeout,
 		IdleTimeout:       value.Timeouts.Idle.Value(),
 		MaxHeaderBytes:    value.Limits.MaxHeaderBytes,
 	}

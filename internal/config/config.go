@@ -20,6 +20,11 @@ import (
 
 const capabilityContext = "tdesktop-web-proxy-bridge-v1\n"
 
+// MaxCarrierBatchBytes is the largest downlink body a carrier may deliver:
+// the desktop client's browser-fallback loopback WebSocket rejects messages
+// above 2 MiB, so a larger relay batch would kill that carrier.
+const MaxCarrierBatchBytes = 2 * 1024 * 1024
+
 type CarrierMode string
 
 const (
@@ -206,7 +211,7 @@ func Defaults() Config {
 		Timeouts: Timeouts{
 			BackendDial:       Duration(5 * time.Second),
 			LongPoll:          Duration(25 * time.Second),
-			ReconnectGrace:    Duration(10 * time.Minute),
+			ReconnectGrace:    Duration(2 * time.Minute),
 			BootstrapLifetime: Duration(2 * time.Minute),
 			ReadHeader:        Duration(10 * time.Second),
 			Idle:              Duration(75 * time.Second),
@@ -280,6 +285,9 @@ func (c Config) validate() error {
 	}
 	if c.Limits.MaxHeaderBytes < 4096 || c.Limits.MaxBodyBytes < 1024 || c.Limits.MaxFramePayload <= 0 || c.Limits.MaxFramePayload > 1024*1024 || c.Limits.CarrierBatchBytes < 256*1024 || c.Limits.CarrierBatchBytes > c.Limits.MaxBodyBytes {
 		return errors.New("invalid HTTP or frame limits")
+	}
+	if c.Limits.CarrierBatchBytes > MaxCarrierBatchBytes {
+		return errors.New("carrier_batch_bytes must not exceed the 2 MiB desktop loopback message cap")
 	}
 	values := []int{
 		c.Limits.MaxStreamsPerSession, c.Limits.MaxClosedStreamIDs,

@@ -508,6 +508,12 @@ func newConfiguredTestServer(
 	if err := os.WriteFile(filepath.Join(directory, "404.html"), notFound, 0600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(directory, "about.html"), []byte("<!doctype html><title>About</title>"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "favicon.svg"), []byte("<svg xmlns=\"http://www.w3.org/2000/svg\"/>"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	value := config.Defaults()
 	value.PublicHostname = testHost
 	value.PublicDir = directory

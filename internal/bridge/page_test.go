@@ -147,3 +147,81 @@ func TestRenderIncludesSelectableCarrierImplementations(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderedBridgeSurvivesTheRestrictedProfile(t *testing.T) {
+	page, err := Render("proxy.example.com", "bootstrap-token", "https", 2*1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Everything the desktop client's restricted WebView profile defines away
+	// (see lib_webview RestrictedScript) must stay unused by the bridge, which
+	// may only rely on inline script plus fetch/WebSocket to its own origin.
+	for _, forbidden := range []string{
+		"WebAssembly", "RTCPeerConnection", "RTCDataChannel", "WebTransport",
+		"Notification", "PaymentRequest", "PresentationRequest",
+		"MediaRecorder", "SpeechRecognition", "showOpenFilePicker",
+		"navigator.credentials", "navigator.mediaDevices",
+		"navigator.getUserMedia", "navigator.wakeLock", "navigator.share",
+		"navigator.presentation", "navigator.xr", "navigator.getGamepads",
+		"navigator.storage", "navigator.locks", "sendBeacon",
+		"navigator.permissions", "navigator.serviceWorker",
+		"BroadcastChannel", "SharedWorker", "AudioContext",
+		"caches.", "localStorage", "sessionStorage", "indexedDB",
+	} {
+		if strings.Contains(string(page.Body), forbidden) {
+			t.Fatalf("bridge uses %q, which the restricted profile removes", forbidden)
+		}
+	}
+}
+
+func TestRenderedBridgeAvailabilityFixes(t *testing.T) {
+	page, err := Render("proxy.example.com", "bootstrap-token", "https-lanes", 2*1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(page.Body)
+	for _, expected := range []string{
+		// One request body never carries more than the relay's 4096-frame
+		// batch cap, and an oversized first item is split at a frame boundary.
+		"function frameBound(value,maxFrames,maxBytes)",
+		"frameBound(values[count],4096,batchLimit)",
+		"frames+bound.frames>4096",
+		"values[0]=values[0].slice(bound.bytes)",
+		// 503 honours Retry-After and uses a time budget instead of a fixed
+		// attempt count, so a superseded poll or a racing uplink is retried
+		// rather than treated as fatal.
+		"function retryAfterMs(response)",
+		"if(response.status!==503)return response",
+		"const deadline=Date.now()+90000",
+		"if(serviceUnavailable&&Date.now()>=deadline)throw",
+		// A failing bridge tells the relay, and a session created after close
+		// is deleted, so slots are not pinned for the whole reconnect grace.
+		"status('failed');\n if(port)port.postMessage({t:'close'});\n close(true);",
+		"if(closed){fetch(relayOrigin+'/api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}",
+		// Late DATA/WINDOW/CLOSE for a lane the bridge no longer knows is
+		// dropped instead of killing the carrier.
+		"if(!lane&&(value.type===2||value.type===3||value.type===4))return;",
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("rendered bridge lacks %q", expected)
+		}
+	}
+	if strings.Contains(body, "for(let attempt=0;attempt!==9;attempt++)") {
+		t.Fatal("rendered bridge still uses the attempt-only retry loop")
+	}
+	if strings.Contains(body, "if(response.status<500)return response") {
+		t.Fatal("rendered bridge still treats every 5xx as retryable and 503 as attempt-bounded")
+	}
+}
+
+func TestRenderRejectsInvalidHostnameAndOversizedBatch(t *testing.T) {
+	if _, err := Render("Proxy.Example.com", "bootstrap-token", "https", 2*1024*1024); err == nil {
+		t.Fatal("accepted a non-canonical hostname")
+	}
+	if _, err := Render("proxy.example.com/x", "bootstrap-token", "https", 2*1024*1024); err == nil {
+		t.Fatal("accepted a hostname with a path")
+	}
+	if _, err := Render("proxy.example.com", "bootstrap-token", "https", 2*1024*1024+1); err == nil {
+		t.Fatal("accepted a carrier batch above the desktop loopback cap")
+	}
+}

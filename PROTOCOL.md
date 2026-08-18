@@ -172,8 +172,15 @@ in the generated bridge page and fixed for the resulting relay session; clients 
 not need a new setting or protocol implementation.
 
 All carrier requests have `Origin: https://H` and no cookies. The reference relay
-rejects a cookie-bearing API request. Binary HTTP bodies use exactly
-`Content-Type: application/octet-stream`.
+rejects a cookie-bearing HTTP API request; the WebSocket upgrade is exempt because
+a browser's `WebSocket` constructor cannot omit cookies the site may have set.
+Binary HTTP bodies use exactly `Content-Type: application/octet-stream`.
+
+Every request that does not authenticate — unknown bearer, wrong `Origin`, wrong
+method, malformed headers — is answered before the request body is touched, with
+the exact response an unknown static path receives, and any body a client sends is
+read (or discarded) under a bounded deadline. A create body is a single `HELLO`
+frame, so the relay caps it at 64 bytes.
 
 Session creation exchanges a two-minute bootstrap token atomically and
 idempotently:
@@ -209,13 +216,20 @@ Body: one or more complete frames
 X-Up-Ack: 1
 ```
 
-If the next valid batch cannot yet fit the relay's DATA queue budget, the relay
-returns `503 Service Unavailable` with `Retry-After: 1`. The sequence remains
-uncommitted and no frame from the batch is applied. The bridge retries the same
-sequence with the byte-identical body.
+If the next valid batch cannot yet fit the relay's DATA queue budget, or a retry
+of the next sequence arrives while the relay is still parsing the previous request
+for it, the relay returns `503 Service Unavailable` with `Retry-After: 1`. The
+sequence remains uncommitted and no frame from the batch is applied. The bridge
+retries the same sequence with the byte-identical body after honouring
+`Retry-After` (a fixed retry count never applies to 503; a 90-second budget does).
 
-One downlink poll may be active. The cursor acknowledges a previously delivered
-batch. Repeating the old cursor replays the unacknowledged batch byte-for-byte:
+One downlink poll is active at a time and the newest poll wins: when a poll arrives
+while another one is parked (typically because the older connection died silently),
+the newer poll takes over and the older one completes as `204 No Content` with its
+own cursor — harmless if that connection is still alive, unobserved if it is dead.
+A poll is never refused for being concurrent. The cursor acknowledges a previously
+delivered batch. Repeating the old cursor replays the unacknowledged batch
+byte-for-byte:
 
 ```text
 POST /api/v1/down
@@ -251,7 +265,12 @@ may both use uplink sequence `1` and make progress independently.
 When a lane has delivered and acknowledged all queued bytes after its stream closes,
 the relay returns an empty response with `X-Lane-Closed: 1`; the bridge then stops
 polling that lane. Recently closed lane state is retained with the stream tombstone
-so a lost final uplink response can still be acknowledged idempotently.
+so a lost final uplink response can still be acknowledged idempotently. When the
+tombstone is evicted, whatever the lane still held (undelivered frames and their
+byte/item charges) is released, and well-formed late `DATA`, `WINDOW`, or `CLOSE`
+frames for that id are acknowledged and ignored rather than failing the session;
+the bridge likewise drops such frames instead of failing. Lane polls also observe
+`ErrConcurrent`-free newest-poll-wins semantics per lane, exactly like `https`.
 
 This mode mirrors Telegram's native connection allocation and removes carrier-level
 head-of-line blocking between logical sessions. It assumes normal HTTP/2 service at
@@ -268,7 +287,12 @@ Origin: https://H
 Sec-WebSocket-Protocol: tproxy-v1.<session-token>
 ```
 
-The relay echoes that exact subprotocol. Each client WebSocket binary message is a
+The relay echoes that exact subprotocol. Because the session bearer travels in a
+request header here, operators must never enable header logging on the front
+proxy or the relay. The relay pings the peer after every idle long-poll period and
+closes the connection after two such periods without any message or pong, so a
+silently dead peer does not pin the session until the listener's TCP keep-alive.
+Each client WebSocket binary message is a
 bounded batch of complete client-to-relay frames. Each relay binary message is a
 bounded batch of complete relay-to-client frames. WebSocket ordering and reliable
 delivery replace the HTTP sequence and cursor headers; the shared per-stream WINDOW
@@ -323,7 +347,10 @@ The Telegram app, not the bridge JavaScript, prepares the shared frames:
    Telegram networking engine drains those bytes, the client returns that amount as
    `WINDOW` credit.
 5. EOF or failure on either side produces `CLOSE` for that stream. Other streams
-   and the shared carrier continue.
+   and the shared carrier continue. `CLOSE` is an abort, not a half-close:
+   `DATA` still queued for that stream on either side is dropped, exactly like
+   the desktop client's existing TCP path, which never half-closes an MTProto
+   socket either.
 6. Replacing or disabling the WEB proxy closes the carrier session and all of its
    logical streams.
 

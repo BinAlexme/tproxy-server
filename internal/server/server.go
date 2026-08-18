@@ -11,8 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -26,27 +24,37 @@ import (
 
 const webSocketProtocolPrefix = "tproxy-v1."
 
+// A create body is a single HELLO frame (8-byte header + 1-byte payload), so a
+// tiny cap is plenty and keeps an unauthenticated POST /session from streaming
+// megabytes before Create rejects it.
+const maxCreateBodyBytes = 64
+
+// A request body must not be able to hold a relay goroutine and a
+// Caddy->relay connection open indefinitely — neither while a handler reads
+// it nor while net/http discards an unread body before answering. Long polls
+// carry no body, so bounding every body-bearing request leaves them alone.
+const bodyReadDeadline = 30 * time.Second
+
 type Server struct {
-	config   config.Config
-	manager  *session.Manager
-	index    []byte
-	notFound []byte
+	config           config.Config
+	manager          *session.Manager
+	site             *staticSite
+	bodyReadDeadline time.Duration
 }
 
 func New(value config.Config) (*Server, error) {
-	index, err := os.ReadFile(filepath.Join(value.PublicDir, "index.html"))
+	if err := session.ValidateBudget(value); err != nil {
+		return nil, err
+	}
+	site, err := loadStaticSite(value.PublicDir)
 	if err != nil {
 		return nil, err
 	}
-	notFound, err := os.ReadFile(filepath.Join(value.PublicDir, "404.html"))
-	if err != nil {
-		notFound = index
-	}
 	return &Server{
-		config:   value,
-		manager:  session.NewManager(value),
-		index:    index,
-		notFound: notFound,
+		config:           value,
+		manager:          session.NewManager(value),
+		site:             site,
+		bodyReadDeadline: bodyReadDeadline,
 	}, nil
 }
 
@@ -82,43 +90,48 @@ func (s *Server) Shutdown() {
 }
 
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Host != s.config.PublicHostname {
-		s.serveNotFound(w)
+	if r.ContentLength != 0 {
+		s.setReadDeadline(w)
+	}
+	if r.Host != s.config.PublicHostname && r.Host != s.config.PublicHostname+":443" {
+		s.serveNotFound(w, r)
 		return
 	}
-	if r.URL.Path == "/" {
-		s.serveRoot(w, r)
-		return
-	}
-	if r.URL.Path == "/api/v1/session" || r.URL.Path == "/api/v1/up" || r.URL.Path == "/api/v1/down" || r.URL.Path == "/api/v1/ws" {
+	switch r.URL.Path {
+	case "/api/v1/session", "/api/v1/up", "/api/v1/down", "/api/v1/ws":
 		s.serveAPI(w, r)
 		return
 	}
+	if r.URL.Path == "/" &&
+		(r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		s.serveRoot(w, r)
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
 		return
 	}
 	s.serveStatic(w, r)
 }
 
 func (s *Server) serveRoot(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		s.servePublicIndex(w, r.Method == http.MethodHead)
-		return
-	}
+	// bridgeProfile always runs the constant-time capability scan, so GET /,
+	// GET /?x=1 and GET /?bridge=<43 random chars> do byte-, header- and
+	// timing-identical work; only a real capability match takes the branch
+	// below, which a prober can never reach.
 	profile := s.bridgeProfile(r)
-	if profile == nil {
-		s.servePublicIndex(w, false)
+	if profile == nil || r.Method != http.MethodGet {
+		s.serveEntry(w, r, s.site.index, http.StatusOK)
 		return
 	}
 	clientIP, err := s.clientIP(r)
 	if err != nil {
-		s.servePublicIndex(w, false)
+		s.serveEntry(w, r, s.site.index, http.StatusOK)
 		return
 	}
 	token, err := s.manager.IssueBootstrap(profile, clientIP)
 	if err != nil {
-		s.servePublicIndex(w, false)
+		s.serveEntry(w, r, s.site.index, http.StatusOK)
 		return
 	}
 	page, err := bridge.Render(
@@ -127,7 +140,7 @@ func (s *Server) serveRoot(w http.ResponseWriter, r *http.Request) {
 		string(profile.CarrierMode.WithDefault()),
 		s.config.Limits.CarrierBatchBytes)
 	if err != nil {
-		s.servePublicIndex(w, false)
+		s.serveEntry(w, r, s.site.index, http.StatusOK)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -145,13 +158,13 @@ func (s *Server) serveRoot(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 	if r.URL.RawQuery != "" ||
 		r.Header.Get("Origin") != "https://"+s.config.PublicHostname ||
-		r.Header.Get("Cookie") != "" {
-		s.serveNotFound(w)
+		(r.Header.Get("Cookie") != "" && r.URL.Path != "/api/v1/ws") {
+		s.serveNotFound(w, r)
 		return
 	}
 	clientIP, err := s.clientIP(r)
 	if err != nil {
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
 		return
 	}
 	if r.URL.Path == "/api/v1/ws" {
@@ -160,7 +173,7 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	token, ok := bearerToken(r.Header.Get("Authorization"))
 	if !ok {
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
 		return
 	}
 	switch r.URL.Path {
@@ -171,18 +184,18 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 	case "/api/v1/down":
 		s.serveDown(w, r, token)
 	default:
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
 	}
 }
 
 func (s *Server) serveSession(w http.ResponseWriter, r *http.Request, token, clientIP string) {
 	if r.Method == http.MethodDelete {
-		if !emptyBody(r) || r.Header.Get("Content-Type") != "" {
-			s.serveNotFound(w)
+		if err := s.manager.CloseToken(token); err != nil {
+			s.serveNotFound(w, r)
 			return
 		}
-		if err := s.manager.CloseToken(token); err != nil {
-			s.serveNotFound(w)
+		if !emptyBody(r) || r.Header.Get("Content-Type") != "" {
+			s.serveNotFound(w, r)
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
@@ -190,12 +203,16 @@ func (s *Server) serveSession(w http.ResponseWriter, r *http.Request, token, cli
 		return
 	}
 	if r.Method != http.MethodPost || !binaryContentType(r.Header.Get("Content-Type")) {
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
 		return
 	}
-	body, err := readBody(w, r, s.config.Limits.MaxBodyBytes)
+	if !s.manager.HasBootstrap(token) {
+		s.serveNotFound(w, r)
+		return
+	}
+	body, err := readBody(w, r, maxCreateBodyBytes)
 	if err != nil {
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
 		return
 	}
 	result, err := s.manager.Create(token, clientIP, body)
@@ -206,7 +223,7 @@ func (s *Server) serveSession(w http.ResponseWriter, r *http.Request, token, cli
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -221,51 +238,52 @@ func (s *Server) serveSession(w http.ResponseWriter, r *http.Request, token, cli
 
 func (s *Server) serveUp(w http.ResponseWriter, r *http.Request, token string) {
 	if r.Method != http.MethodPost || !binaryContentType(r.Header.Get("Content-Type")) {
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
 		return
 	}
 	sequence, ok := canonicalUint(r.Header.Get("X-Up-Seq"))
 	if !ok || sequence == 0 {
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
 		return
 	}
 	value, err := s.manager.Get(token)
 	if err != nil {
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
 		return
 	}
 	body, err := readBody(w, r, s.config.Limits.MaxBodyBytes)
 	if err != nil {
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
 		return
 	}
 	var ack uint64
 	switch value.CarrierMode() {
 	case config.CarrierHTTPS:
 		if r.Header.Get("X-Lane-ID") != "" {
-			s.serveNotFound(w)
+			s.serveNotFound(w, r)
 			return
 		}
 		ack, err = value.ProcessUp(sequence, body)
 	case config.CarrierHTTPSLanes:
 		lane, ok := canonicalUint(r.Header.Get("X-Lane-ID"))
 		if !ok || lane > frame.MaxStreamID {
-			s.serveNotFound(w)
+			s.serveNotFound(w, r)
 			return
 		}
 		ack, err = value.ProcessUpLane(uint32(lane), sequence, body)
 	default:
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
 		return
 	}
 	if err != nil {
-		if errors.Is(err, session.ErrBackpressure) {
+		if errors.Is(err, session.ErrBackpressure) ||
+			errors.Is(err, session.ErrConcurrent) {
 			w.Header().Set("Cache-Control", "no-store")
 			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
@@ -274,18 +292,22 @@ func (s *Server) serveUp(w http.ResponseWriter, r *http.Request, token string) {
 }
 
 func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string) {
-	if r.Method != http.MethodPost || !emptyBody(r) || r.Header.Get("Content-Type") != "" {
-		s.serveNotFound(w)
+	if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "" {
+		s.serveNotFound(w, r)
 		return
 	}
 	cursor, ok := canonicalUint(r.Header.Get("X-Down-Cursor"))
 	if !ok {
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
 		return
 	}
 	value, err := s.manager.Get(token)
 	if err != nil {
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
+		return
+	}
+	if !emptyBody(r) {
+		s.serveNotFound(w, r)
 		return
 	}
 	var body []byte
@@ -294,14 +316,14 @@ func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string)
 	switch value.CarrierMode() {
 	case config.CarrierHTTPS:
 		if r.Header.Get("X-Lane-ID") != "" {
-			s.serveNotFound(w)
+			s.serveNotFound(w, r)
 			return
 		}
 		body, next, err = value.Poll(r.Context(), cursor)
 	case config.CarrierHTTPSLanes:
 		lane, ok := canonicalUint(r.Header.Get("X-Lane-ID"))
 		if !ok || lane > frame.MaxStreamID {
-			s.serveNotFound(w)
+			s.serveNotFound(w, r)
 			return
 		}
 		body, next, laneClosed, err = value.PollLane(
@@ -309,14 +331,20 @@ func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string)
 			uint32(lane),
 			cursor)
 	default:
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
 		return
 	}
 	if err != nil {
 		if r.Context().Err() != nil {
 			return
 		}
-		s.serveNotFound(w)
+		if errors.Is(err, session.ErrConcurrent) {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		s.serveNotFound(w, r)
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
@@ -335,23 +363,31 @@ func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string)
 }
 
 func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet || r.Header.Get("Authorization") != "" || !emptyBody(r) {
-		s.serveNotFound(w)
+	if r.Method != http.MethodGet || r.Header.Get("Authorization") != "" {
+		s.serveNotFound(w, r)
 		return
 	}
 	protocols := websocket.Subprotocols(r)
 	if len(protocols) != 1 || !strings.HasPrefix(protocols[0], webSocketProtocolPrefix) {
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
 		return
 	}
 	token := strings.TrimPrefix(protocols[0], webSocketProtocolPrefix)
 	if _, ok := bearerToken("Bearer " + token); !ok {
-		s.serveNotFound(w)
+		s.serveNotFound(w, r)
 		return
 	}
 	value, err := s.manager.Get(token)
-	if err != nil || value.CarrierMode() != config.CarrierWebSocket || !value.AcquireWebSocket() {
-		s.serveNotFound(w)
+	if err != nil || value.CarrierMode() != config.CarrierWebSocket {
+		s.serveNotFound(w, r)
+		return
+	}
+	if !emptyBody(r) {
+		s.serveNotFound(w, r)
+		return
+	}
+	if !value.AcquireWebSocket() {
+		s.serveNotFound(w, r)
 		return
 	}
 	upgrader := websocket.Upgrader{
@@ -370,10 +406,19 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer connection.Close()
 	defer value.Close()
 	connection.SetReadLimit(int64(s.config.Limits.MaxBodyBytes))
+	// A dead peer that never sends is otherwise only noticed by the listener's
+	// TCP keep-alive minutes later: bound silence to two long-poll periods,
+	// refreshed by every message and every pong, and let the writer ping the
+	// peer whenever a poll period passes without downlink data.
+	idle := 2 * s.config.Timeouts.LongPoll.Value()
+	_ = connection.SetReadDeadline(time.Now().Add(idle))
+	connection.SetPongHandler(func(string) error {
+		return connection.SetReadDeadline(time.Now().Add(idle))
+	})
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	finished := make(chan error, 2)
-	go s.readWebSocket(ctx, connection, value, finished)
+	go s.readWebSocket(ctx, connection, value, idle, finished)
 	go s.writeWebSocket(ctx, connection, value, finished)
 	<-finished
 }
@@ -382,6 +427,7 @@ func (s *Server) readWebSocket(
 	ctx context.Context,
 	connection *websocket.Conn,
 	value *session.Session,
+	idle time.Duration,
 	finished chan<- error) {
 	sequence := uint64(1)
 	for {
@@ -390,6 +436,7 @@ func (s *Server) readWebSocket(
 			finished <- err
 			return
 		}
+		_ = connection.SetReadDeadline(time.Now().Add(idle))
 		if messageType != websocket.BinaryMessage || len(body) == 0 {
 			finished <- session.ErrProtocol
 			return
@@ -435,12 +482,16 @@ func (s *Server) writeWebSocket(
 			finished <- err
 			return
 		}
-		if len(body) == 0 {
-			continue
-		}
 		if err := connection.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
 			finished <- err
 			return
+		}
+		if len(body) == 0 {
+			if err := connection.WriteMessage(websocket.PingMessage, nil); err != nil {
+				finished <- err
+				return
+			}
+			continue
 		}
 		if err := connection.WriteMessage(websocket.BinaryMessage, body); err != nil {
 			finished <- err
@@ -451,19 +502,28 @@ func (s *Server) writeWebSocket(
 }
 
 func (s *Server) bridgeProfile(r *http.Request) *config.Profile {
+	// A well-formed capability yields the 32 decoded bytes; anything else
+	// yields a zeroed dummy. MatchCapability runs on both, so the
+	// constant-time scan cost is identical whether or not the request even
+	// carried a bridge query — a prober cannot time the difference.
+	candidate := make([]byte, sha256.Size)
+	valid := false
 	query := r.URL.Query()
-	values, exists := query["bridge"]
-	if !exists || len(query) != 1 || len(values) != 1 || len(values[0]) != 43 {
+	if values, exists := query["bridge"]; exists &&
+		len(query) == 1 && len(values) == 1 && len(values[0]) == 43 &&
+		r.URL.RawQuery == "bridge="+values[0] {
+		if decoded, err := base64.RawURLEncoding.DecodeString(values[0]); err == nil &&
+			len(decoded) == sha256.Size &&
+			base64.RawURLEncoding.EncodeToString(decoded) == values[0] {
+			copy(candidate, decoded)
+			valid = true
+		}
+	}
+	profile := s.manager.MatchCapability(candidate)
+	if !valid {
 		return nil
 	}
-	if r.URL.RawQuery != "bridge="+values[0] {
-		return nil
-	}
-	decoded, err := base64.RawURLEncoding.DecodeString(values[0])
-	if err != nil || len(decoded) != sha256.Size || base64.RawURLEncoding.EncodeToString(decoded) != values[0] {
-		return nil
-	}
-	return s.manager.MatchCapability(decoded)
+	return profile
 }
 
 func (s *Server) clientIP(r *http.Request) (string, error) {
@@ -489,58 +549,16 @@ func (s *Server) clientIP(r *http.Request) (string, error) {
 	return parsed.String(), nil
 }
 
-func (s *Server) servePublicIndex(w http.ResponseWriter, head bool) {
-	s.publicHeaders(w)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Content-Length", strconv.Itoa(len(s.index)))
-	w.WriteHeader(http.StatusOK)
-	if !head {
-		_, _ = w.Write(s.index)
-	}
-}
-
 func (s *Server) serveStatic(w http.ResponseWriter, r *http.Request) {
-	clean := filepath.Clean("/" + r.URL.Path)
-	if clean != r.URL.Path || strings.Contains(clean, "\\") {
-		s.serveNotFound(w)
+	if entry := s.site.resolve(r.URL.Path); entry != nil {
+		s.serveEntry(w, r, entry, http.StatusOK)
 		return
 	}
-	relative := strings.TrimPrefix(clean, "/")
-	candidates := []string{relative}
-	if relative == "favicon.ico" {
-		candidates = []string{"favicon.svg"}
-	}
-	if filepath.Ext(relative) == "" {
-		candidates = append(candidates, relative+".html")
-	}
-	for _, candidate := range candidates {
-		path := filepath.Join(s.config.PublicDir, candidate)
-		info, err := os.Stat(path)
-		if err != nil || !info.Mode().IsRegular() {
-			continue
-		}
-		s.publicHeaders(w)
-		http.ServeFile(w, r, path)
-		return
-	}
-	s.serveNotFound(w)
+	s.serveNotFound(w, r)
 }
 
-func (s *Server) serveNotFound(w http.ResponseWriter) {
-	s.publicHeaders(w)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Content-Length", strconv.Itoa(len(s.notFound)))
-	w.WriteHeader(http.StatusNotFound)
-	_, _ = w.Write(s.notFound)
-}
-
-func (s *Server) publicHeaders(w http.ResponseWriter) {
-	w.Header().Set("Cache-Control", "public, max-age=300")
-	w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
-	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("X-Frame-Options", "DENY")
-	w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+func (s *Server) serveNotFound(w http.ResponseWriter, r *http.Request) {
+	s.serveEntry(w, r, s.site.notFound, http.StatusNotFound)
 }
 
 func (s *Server) serveReady(w http.ResponseWriter, r *http.Request) {
@@ -589,6 +607,12 @@ func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
 		metrics.StreamsOpened, metrics.StreamsRejected,
 		metrics.BackendDialFailures, metrics.BytesUp, metrics.BytesDown,
 		metrics.LimitHits)
+}
+
+func (s *Server) setReadDeadline(w http.ResponseWriter) {
+	if controller := http.NewResponseController(w); controller != nil {
+		_ = controller.SetReadDeadline(time.Now().Add(s.bodyReadDeadline))
+	}
 }
 
 func readBody(w http.ResponseWriter, r *http.Request, limit int) ([]byte, error) {

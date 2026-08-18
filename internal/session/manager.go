@@ -272,6 +272,18 @@ func (m *Manager) Create(token, clientIP string, body []byte) (CreateResult, err
 	}, nil
 }
 
+func (m *Manager) HasBootstrap(token string) bool {
+	hash, err := tokenHash(token)
+	if err != nil {
+		return false
+	}
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry := m.bootstraps[hash]
+	return entry != nil && !now.After(entry.expires)
+}
+
 func (m *Manager) Get(token string) (*Session, error) {
 	hash, err := tokenHash(token)
 	if err != nil {

@@ -215,13 +215,15 @@ Caddy responsibilities:
 - obtain and renew a normal certificate for the public hostname;
 - negotiate HTTP/1.1 and HTTP/2 normally;
 - apply standard response headers;
-- reverse proxy exact path `/` to Go so Go can choose public index versus bridge;
-- reverse proxy `/api/v1/*` to Go;
-- serve all other public pages/assets from the static directory;
-- serve the static index through Caddy's error handler if the root Go upstream is
-  unavailable, so the public root remains available during relay restarts;
+- reverse proxy every path to Go: Go serves the public site from memory, chooses
+  public index versus bridge on `/`, and answers unauthenticated `/api/v1/*` and
+  every other miss through the same code path with the same headers, so no
+  request without a valid capability can tell relay-served from file-served
+  paths (there is no separate `file_server` and no second hop);
+- when the Go upstream is down, answer every path the same way, like any other
+  backend-down site — no path is special-cased in the error handler;
 - preserve streaming/long-poll responses and use a timeout longer than the relay's
-  25-second poll hold;
+  25-second poll hold, and a body-read timeout well above it;
 - never enable access logging that records raw URIs, query strings, Authorization
   headers, or request bodies.
 
@@ -534,8 +536,9 @@ batch, the RTT-only upper bound for a continuously busy direction is `2 MiB / RT
 Transfer time, the relay-to-MTProxy path, and WebView scheduling lower the measured
 rate. The 4 MiB stream window is intentionally larger than one carrier batch, so a
 single stream can continue while returned WINDOW credit crosses the opposite
-carrier. Caddy compression is limited to static-site routes; encrypted carrier
-bodies are never sent through zstd/gzip. On a controlled link with at least
+carrier. Caddy compression is enabled site-wide so every response is wrapped
+identically; its default content-type match excludes `application/octet-stream`,
+so encrypted carrier bodies are never sent through zstd/gzip. On a controlled link with at least
 100 Mbit/s capacity, the acceptance target is 20 Mbit/s at 500 ms RTT and 40 Mbit/s
 at 200 ms RTT through each native WebView implementation and, where supported, its
 optional system-browser carrier.
@@ -617,9 +620,12 @@ and 16384 retained buffers. It counts an in-flight request until acknowledgement
 a slow upload cannot hide one full batch from the queue limit.
 
 The WebView carrier may lose connectivity while its page remains alive. The same
-session survives carrier gaps for ten minutes, allowing retries after ordinary
-network loss or a five-minute system sleep. When that grace expires, or when the
-relay process restarts, live MTProxy TCP streams cannot be reconstructed safely.
+session survives carrier gaps for the configured reconnect grace (two minutes by
+default: an alive bridge refreshes the session on every long poll, its own retry
+window fits under that, and the desktop MTProto layer has reset its connections
+after ~30–45 s of silence anyway; raise it for clients that background for
+minutes). When that grace expires, or when the relay process restarts, live
+MTProxy TCP streams cannot be reconstructed safely.
 The bridge emits
 `close`; the client re-derives its capability and obtains a fresh bridge page and
 relay session automatically. A platform may offer an explicit system-browser
@@ -740,7 +746,7 @@ Initial defaults are configurable and covered by tests:
 | New bootstraps process-wide | 1200/minute, burst 256 |
 | Backend dial timeout | 5 seconds |
 | Long-poll hold | 25 seconds |
-| Carrier reconnect grace | 10 minutes |
+| Carrier reconnect grace | 2 minutes |
 | Bootstrap lifetime | 2 minutes |
 
 Additional requirements:
