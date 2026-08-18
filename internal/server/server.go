@@ -179,7 +179,6 @@ func (s *Server) serveRoot(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 	if r.URL.RawQuery != "" ||
-		r.Header.Get("Origin") != "https://"+s.config.PublicHostname ||
 		(r.Header.Get("Cookie") != "" && r.URL.Path != "/api/v1/ws") {
 		s.serveNotFound(w, r)
 		return
@@ -210,7 +209,12 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) serveSession(w http.ResponseWriter, r *http.Request, token, clientIP string) {
+func (s *Server) serveSession(
+	w http.ResponseWriter,
+	r *http.Request,
+	token string,
+	clientIP string,
+) {
 	if r.Method == http.MethodDelete {
 		if err := s.manager.CloseToken(token); err != nil {
 			s.serveNotFound(w, r)
@@ -428,8 +432,8 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		ReadBufferSize:  64 * 1024,
 		WriteBufferSize: 64 * 1024,
 		Subprotocols:    protocols,
-		CheckOrigin: func(request *http.Request) bool {
-			return request.Header.Get("Origin") == "https://"+s.config.PublicHostname
+		CheckOrigin: func(*http.Request) bool {
+			return true
 		},
 	}
 	connection, err := upgrader.Upgrade(w, r, nil)

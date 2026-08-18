@@ -779,7 +779,9 @@ Additional requirements:
   reads before they consume either reserve;
 - cap live streams, in-flight backend dials, and their creation rates globally and
   per profile; reject one excess stream without tearing down its session;
-- disable CORS and validate same-origin POST requests;
+- disable CORS and authenticate carrier requests with bearer tokens rather than
+  the browser-controlled `Origin` header, which native WebViews may omit and
+  non-browser clients can spoof;
 - never log bridge URLs, queries, bearer tokens, frame payloads, MTProxy bytes, or
   MTProxy secrets;
 - avoid analytics or third-party resources on the bridge response;

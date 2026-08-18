@@ -197,7 +197,7 @@ func TestPublicFallbackAndCarrierRoundTrip(t *testing.T) {
 	}
 }
 
-func TestAPIRejectsWrongOriginAsPublic404(t *testing.T) {
+func TestAPIRejectsUnknownBearerAsPublic404(t *testing.T) {
 	backend := startEchoBackend(t)
 	application, _ := newTestServer(t, backend)
 	defer application.Shutdown()
@@ -211,6 +211,49 @@ func TestAPIRejectsWrongOriginAsPublic404(t *testing.T) {
 	body := readResponse(t, response)
 	if response.StatusCode != http.StatusNotFound || !bytes.Contains(body, []byte("Operator Site")) {
 		t.Fatal("invalid API request did not receive the ordinary public 404")
+	}
+}
+
+func TestSessionAuthenticationDoesNotDependOnOrigin(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newTestServer(t, backend)
+	defer application.Shutdown()
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	bootstrap, err := application.manager.IssueBootstrap(
+		&application.config.Profiles[0],
+		"198.51.100.7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hello := frame.Encode(frame.Hello, 0, []byte{1})
+	createdRequest := apiRequest(
+		t,
+		http.MethodPost,
+		hosted.URL+"/api/v1/session",
+		bootstrap,
+		hello)
+	createdRequest.Header.Del("Origin")
+	created := perform(t, hosted.Client(), createdRequest)
+	_ = readResponse(t, created)
+	sessionToken := created.Header.Get("X-Session-Token")
+	if created.StatusCode != http.StatusOK || sessionToken == "" {
+		t.Fatalf("missing Origin rejected session creation: status %d", created.StatusCode)
+	}
+
+	retryRequest := apiRequest(
+		t,
+		http.MethodPost,
+		hosted.URL+"/api/v1/session",
+		bootstrap,
+		hello)
+	retryRequest.Header.Set("Origin", "https://wrong.example")
+	retried := perform(t, hosted.Client(), retryRequest)
+	_ = readResponse(t, retried)
+	if retried.StatusCode != http.StatusOK ||
+		retried.Header.Get("X-Session-Token") != sessionToken {
+		t.Fatal("arbitrary Origin changed authenticated session retry")
 	}
 }
 
@@ -454,7 +497,7 @@ func TestWebSocketCarrierRoundTrip(t *testing.T) {
 		},
 	}
 	headers := http.Header{
-		"Origin":          []string{"https://" + testHost},
+		"Origin":          []string{"https://wrong.example"},
 		"X-Forwarded-For": []string{"198.51.100.7"},
 	}
 	connection, response, err := dialer.Dial("ws://"+testHost+"/api/v1/ws", headers)
@@ -537,7 +580,6 @@ func TestWebSocketLanesRemainIndependent(t *testing.T) {
 			},
 		}
 		headers := http.Header{
-			"Origin":          []string{"https://" + testHost},
 			"X-Forwarded-For": []string{"198.51.100.7"},
 		}
 		connection, response, err := dialer.Dial(

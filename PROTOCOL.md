@@ -172,13 +172,16 @@ mode. The choice is embedded in the generated bridge page and fixed for the
 resulting relay session; clients do not need a new setting or protocol
 implementation.
 
-All carrier requests have `Origin: https://H` and no cookies. The reference relay
-rejects a cookie-bearing HTTP API request; the WebSocket upgrade is exempt because
-a browser's `WebSocket` constructor cannot omit cookies the site may have set.
+Carrier requests normally have `Origin: https://H`, but the reference relay does
+not authenticate that header: native WebViews may omit it, while non-browser
+clients can spoof it. Authentication comes from the unguessable bootstrap or
+session bearer. HTTP carrier requests have no cookies, and the relay rejects a
+cookie-bearing HTTP API request; the WebSocket upgrade is exempt because a
+browser's `WebSocket` constructor cannot omit cookies the site may have set.
 Binary HTTP bodies use exactly `Content-Type: application/octet-stream`.
 
-Every request that does not authenticate — unknown bearer, wrong `Origin`, wrong
-method, malformed headers — is answered before the request body is touched, with
+Every request that does not authenticate — unknown bearer, wrong method, malformed
+headers — is answered before the request body is touched, with
 the exact response an unknown static path receives, and any body a client sends is
 read (or discarded) under a bounded deadline. A create body is a single `HELLO`
 frame, so the relay caps it at 64 bytes.
