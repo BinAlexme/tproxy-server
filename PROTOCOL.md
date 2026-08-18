@@ -123,8 +123,8 @@ service workers, dedicated/shared workers, popups, downloads, forms, WebRTC, dev
 permissions, clipboard access, or cross-origin requests. A client may therefore
 disable those facilities without changing the carrier protocol. It must still
 allow the nonce-bearing inline script, exact-origin HTTPS requests, same-origin WSS
-when the profile selects `websocket`, ordinary timers, and the selected
-authenticated client boundary.
+when the profile selects `websocket` or `websocket-lanes`, ordinary timers, and
+the selected authenticated client boundary.
 
 The reference response enforces the same profile with this CSP:
 
@@ -166,10 +166,11 @@ controls its own document and response headers.
 
 ## Carrier modes
 
-Each server profile selects one `carrier_mode`: `https`, `https-lanes`, or
-`websocket`. Omitting it preserves the original `https` mode. The choice is embedded
-in the generated bridge page and fixed for the resulting relay session; clients do
-not need a new setting or protocol implementation.
+Each server profile selects one `carrier_mode`: `https`, `https-lanes`,
+`websocket`, or `websocket-lanes`. Omitting it preserves the original `https`
+mode. The choice is embedded in the generated bridge page and fixed for the
+resulting relay session; clients do not need a new setting or protocol
+implementation.
 
 All carrier requests have `Origin: https://H` and no cookies. The reference relay
 rejects a cookie-bearing HTTP API request; the WebSocket upgrade is exempt because
@@ -193,7 +194,7 @@ Body: one HELLO frame
 200 OK
 X-Session-Token: session-token
 X-Down-Cursor: 0
-X-Carrier-Mode: https | https-lanes | websocket
+X-Carrier-Mode: https | https-lanes | websocket | websocket-lanes
 Body: one WELCOME frame
 ```
 
@@ -297,8 +298,8 @@ bounded batch of complete client-to-relay frames. Each relay binary message is a
 bounded batch of complete relay-to-client frames. WebSocket ordering and reliable
 delivery replace the HTTP sequence and cursor headers; the shared per-stream WINDOW
 protocol remains authoritative for end-to-end backpressure. Text messages,
-additional WebSockets for the same relay session, oversized messages, malformed
-frame batches, and an incorrect subprotocol are rejected.
+additional multiplexed WebSockets for the same relay session, oversized messages,
+malformed frame batches, and an incorrect subprotocol are rejected.
 
 The bridge limits its queued plus browser-buffered uplink to 32 MiB. The relay waits
 up to 30 seconds for temporary backend-write backpressure to clear before closing the
@@ -306,9 +307,47 @@ carrier. A WebSocket loss closes the relay session and every logical stream; thi
 reference implementation does not resume a partially delivered WebSocket session.
 
 One multiplexed WebSocket is sufficient for correctness and removes the HTTP
-stop-and-wait ceiling. A WebSocket per Telegram stream would additionally isolate
-TCP loss and congestion between sessions, but greatly increases TLS/WebSocket
-connection count and is not part of the current reference modes.
+stop-and-wait ceiling. It does not preserve the queue and failure isolation of the
+separate TCP connections Telegram normally uses for API, upload, and download
+sessions.
+
+### Stream-aware WebSocket lanes
+
+`websocket-lanes` performs the same HTTPS session creation but opens one
+same-origin WebSocket for every nonzero shared stream:
+
+```text
+GET /api/v1/ws
+Origin: https://H
+Sec-WebSocket-Protocol: tproxy-lane-v1.<session-token>.<decimal stream_id>
+```
+
+The relay echoes the exact subprotocol. The stream id is canonical decimal, is
+never zero, and cannot be reused during the parent relay session. Only one socket
+may be attached to a stream id. The first binary message must begin with `OPEN`,
+and every frame sent or received on that socket has the selected stream id. There
+is no lane-zero WebSocket: HTTPS bootstrap carries `HELLO` and `WELCOME`, while
+WebSocket protocol ping/pong frames provide connection liveness.
+
+Each socket has independent ordered delivery, browser buffering, relay writer,
+and backend connection. Closing an established lane unexpectedly closes that one
+backend stream, and the bridge returns a `CLOSE` frame to the app; other lanes and
+the parent relay session remain active. A client or backend `CLOSE` completes that
+lane's shutdown and then closes its socket. Failure to establish a new lane is
+treated as parent-carrier failure because it normally means the relay session,
+origin, or network is no longer usable. Deleting or expiring the parent session
+still closes every lane. The relay closes only the affected established lane for
+a text, oversized, malformed, or cross-lane client message; the bridge treats an
+invalid relay message as parent-carrier failure. It retains the 32 MiB global
+uplink bound and additionally limits each lane to 8 MiB and 1024 queued items.
+
+The mode removes application-level head-of-line blocking between interactive API
+and bulk media streams. It can also isolate TCP congestion and packet loss when
+the WebView assigns separate network connections, but that is not guaranteed when
+the engine carries several WebSockets over one HTTP/2 connection. The number of
+live lane sockets is bounded by the profile and session stream limits. Operators
+trade the improved isolation for additional WebSocket/TLS setup, connections, and
+server resources.
 
 `DELETE /api/v1/session` with the session bearer closes all streams and is
 idempotent for a currently authenticated session. Tokens are 32 random bytes in
@@ -355,11 +394,13 @@ The Telegram app, not the bridge JavaScript, prepares the shared frames:
    logical streams.
 
 The bridge batches complete client frames and delivers complete relay frames. In
-`https-lanes` it parses only the shared header and frame boundary needed to select a
-lane; it never interprets DATA, creates MTProxy payloads, or assigns stream ids.
+`https-lanes` and `websocket-lanes` it parses only the shared header and frame
+boundary needed to select a lane; it never interprets DATA, creates MTProxy
+payloads, or assigns stream ids.
 
-The implementation does not emit PING or BYE in v1. A carrier failure closes the
-authenticated relay session and the bridge tells the client to replace it.
+The implementation does not emit shared-frame PING or BYE in v1. A parent-carrier
+failure closes the authenticated relay session and the bridge tells the client to
+replace it. An established `websocket-lanes` socket failure closes only its stream.
 
 The maximum payload is 1 MiB. Relay DATA chunks are at most 64 KiB. Each stream
 begins with 4 MiB of credit in each direction. Client DATA consumes relay receive

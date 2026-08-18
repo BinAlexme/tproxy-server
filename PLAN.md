@@ -69,9 +69,9 @@ deployable server with several future products. This revision fixes the followin
    query value. WebView inputs contain that derived value rather than the MTProxy
    secret.
 3. Profiles can select the baseline serialized HTTPS carrier, stream-aware HTTPS
-   lanes, or one multiplexed WebSocket. Streaming fetch, H3, Telegram Web
-   integration, calls, cross-process session resume, and per-stream WebSockets
-   remain deferred.
+   lanes, one multiplexed WebSocket, or one WebSocket per logical stream.
+   Streaming fetch, H3, Telegram Web integration, calls, and cross-process session
+   resume remain deferred.
 4. Caddy terminates TLS and serves the public site. The Go process is an internal
    application server.
 5. The official MTProxy `-H` and `-p` arguments are ports, not bind addresses.
@@ -311,8 +311,8 @@ After initialization:
   stopped and the bridge must close its relay session.
 
 The bridge interprets only frame boundaries and stream ids when an injected WebView
-requires downlink splitting or `https-lanes` requires routing. It never interprets
-opaque DATA. Its
+requires downlink splitting or a lane carrier requires routing. It never
+interprets opaque DATA. Its
 first upstream binary message is sent verbatim as the session-creation body; the
 relay validates that it is the v1 `HELLO`. Later binary messages are serialized and
 batched without interpreting DATA.
@@ -323,7 +323,8 @@ Bridge behavior:
 2. `POST /api/v1/session` with the bootstrap token and first buffer.
 3. Forward the returned `WELCOME` body to the client boundary.
 4. Run the profile-selected carrier: one serialized HTTPS pair, one independent
-   HTTPS pair per logical stream, or one multiplexed WebSocket.
+   HTTPS pair per logical stream, one multiplexed WebSocket, or one WebSocket per
+   logical stream.
 5. Retry ambiguous HTTP failures with the same sequence/cursor and byte-identical
    body, using bounded exponential backoff with jitter.
 6. Report `reconnecting` during transient carrier loss.
@@ -546,9 +547,11 @@ optional system-browser carrier.
 The `https-lanes` mode removes this global stop-and-wait ceiling by giving each
 logical stream independent request sequencing and replay state. The `websocket`
 mode removes the HTTP acknowledgement cycle with one ordered, flow-controlled
-socket. WebView IPC, one extra relay path and TLS leg, and some shared-carrier
-head-of-line exposure remain. Direct transport therefore remains the latency and
-peak-throughput reference.
+socket. `websocket-lanes` additionally isolates browser queues and relay writers
+between logical streams, at the cost of more WebSocket connections and handshakes;
+independent TCP congestion domains still depend on WebView connection allocation.
+WebView IPC and one extra relay path and TLS leg remain. Direct transport therefore
+remains the latency and peak-throughput reference.
 
 ### 7.4 Performance optimization and consolidation decision
 

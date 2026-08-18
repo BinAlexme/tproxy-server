@@ -26,7 +26,7 @@ func Render(hostname, bootstrapToken, carrierMode string, batchBytes int) (Page,
 	if batchBytes <= 0 || batchBytes > config.MaxCarrierBatchBytes {
 		return Page{}, errors.New("carrier batch size out of range")
 	}
-	if carrierMode != "https" && carrierMode != "https-lanes" && carrierMode != "websocket" {
+	if !config.CarrierMode(carrierMode).Valid() {
 		return Page{}, errors.New("invalid carrier mode")
 	}
 	nonceBytes := make([]byte, 18)
@@ -95,7 +95,11 @@ const options=(method,token,body,headers,signal,keepalive)=>({
  method,body,signal,keepalive:!!keepalive,mode:'same-origin',credentials:'omit',cache:'no-store',redirect:'error',referrerPolicy:'no-referrer',
  headers:Object.assign(token?{Authorization:'Bearer '+token}:{},body?{'Content-Type':'application/octet-stream'}:{},headers||{})
 });
-const bufferedBytes=()=>webSocket&&webSocket.readyState===WebSocket.OPEN?webSocket.bufferedAmount:0;
+const bufferedBytes=()=>{
+ let total=webSocket&&webSocket.readyState===WebSocket.OPEN?webSocket.bufferedAmount:0;
+ if(carrierMode==='websocket-lanes')for(const lane of lanes.values())if(lane.socket&&lane.socket.readyState===WebSocket.OPEN)total+=lane.socket.bufferedAmount;
+ return total;
+};
 function reserve(data,lane){
  if(!data.byteLength||queuedBytes+bufferedBytes()>queueLimit-data.byteLength||queuedItems>=queueItemLimit)return false;
  if(lane&&(lane.bytes>laneQueueLimit-data.byteLength||lane.items>=laneItemLimit))return false;
@@ -214,7 +218,8 @@ function queueCarrier(data){
  try{
   if(carrierMode==='https')queueUp(data);
   else if(carrierMode==='https-lanes')for(const value of splitFrames(data))queueLane(value);
-  else queueWebSocket(data);
+  else if(carrierMode==='websocket')queueWebSocket(data);
+  else for(const value of splitFrames(data))queueWebSocketLane(value);
  }catch(error){fail()}
 }
 function queueUp(data){
@@ -250,7 +255,7 @@ async function poll(){
 }
 function ensureLane(id){
  let lane=lanes.get(id);
- if(!lane){lane={id,sequence:1,cursor:'0',pending:[],bytes:0,items:0,running:false,polling:false};lanes.set(id,lane)}
+ if(!lane){lane={id,sequence:1,cursor:'0',pending:[],bytes:0,items:0,running:false,polling:false,socket:null,timer:0,opened:false,localClosed:false,remoteClosed:false,finished:false};lanes.set(id,lane)}
  return lane;
 }
 function rememberLaneClosed(id){
@@ -332,11 +337,70 @@ function runWebSocketUp(){
   if(upPending.length)queueMicrotask(runWebSocketUp);
  }catch(error){fail()}
 }
+function closeFrame(id){
+ const data=new ArrayBuffer(8),view=new DataView(data);
+ view.setUint8(0,3);view.setUint8(1,id>>>16);view.setUint8(2,id>>>8);view.setUint8(3,id);view.setUint32(4,0);
+ return data;
+}
+function finishWebSocketLane(lane,notify){
+ if(lane.finished||lanes.get(lane.id)!==lane)return;
+ lane.finished=true;if(lane.timer)clearTimeout(lane.timer);
+ if(lane.bytes||lane.items)release(lane.bytes,lane.items,lane);
+ lane.pending.length=0;lanes.delete(lane.id);rememberLaneClosed(lane.id);
+ if(lane.socket&&(lane.socket.readyState===WebSocket.OPEN||lane.socket.readyState===WebSocket.CONNECTING))try{lane.socket.close()}catch(error){}
+ if(notify&&port&&!closed){const frame=closeFrame(lane.id);port.postMessage(frame,[frame])}
+}
+function openWebSocketLane(lane){
+ const target=relayOrigin.replace(/^https:/,'wss:')+'/api/v1/ws';
+ const socket=new WebSocket(target,'tproxy-lane-v1.'+sessionToken+'.'+lane.id);
+ lane.socket=socket;socket.binaryType='arraybuffer';
+ socket.onopen=()=>{if(closed||lane.finished){socket.close();return}lane.opened=true;status('connected');runWebSocketLaneUp(lane)};
+ socket.onmessage=event=>{
+  if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail();return}
+  let values;try{values=splitFrames(event.data)}catch(error){fail();return}
+  if(values.some(value=>value.id!==lane.id)){fail();return}
+  if(values.some(value=>value.type===3))lane.remoteClosed=true;
+  port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data]);status('connected');
+ };
+ socket.onerror=()=>{};
+ socket.onclose=()=>{
+  if(closed||lane.finished)return;
+  if(!lane.opened){fail();return}
+  finishWebSocketLane(lane,!lane.localClosed&&!lane.remoteClosed);
+ };
+}
+function queueWebSocketLane(value){
+ let lane=lanes.get(value.id);
+ if(!lane&&(value.type===2||value.type===3||value.type===4))return;
+ if(!value.id||(!lane&&closedLanes.has(value.id)))throw new Error('closed lane was reused');
+ if(!lane&&value.type!==1)throw new Error('lane did not begin with OPEN');
+ lane=lane||ensureLane(value.id);
+ if(!reserve(value.data,lane)){fail();return}
+ lane.pending.push(value.data);if(value.type===3)lane.localClosed=true;
+ if(!lane.socket)openWebSocketLane(lane);else runWebSocketLaneUp(lane);
+}
+function runWebSocketLaneUp(lane){
+ const socket=lane.socket;
+ if(closed||lane.finished||!socket||socket.readyState!==WebSocket.OPEN||!lane.pending.length)return;
+ if(socket.bufferedAmount>=batchLimit){
+  if(!lane.timer)lane.timer=setTimeout(()=>{lane.timer=0;runWebSocketLaneUp(lane)},10);
+  return;
+ }
+ try{
+  const batch=joinPending(lane.pending,lane);socket.send(batch.body);release(batch.total,batch.count,lane);
+  port.postMessage({t:'traffic',up:batch.total,down:0});
+  if(lane.pending.length)queueMicrotask(()=>runWebSocketLaneUp(lane));
+ }catch(error){fail()}
+}
 function close(notifyServer){
  if(closed)return;
  closed=true;
  if(pollController)pollController.abort();
- for(const lane of lanes.values())if(lane.controller)lane.controller.abort();
+ for(const lane of lanes.values()){
+  if(lane.controller)lane.controller.abort();
+  if(lane.timer)clearTimeout(lane.timer);
+  if(lane.socket)try{lane.socket.close()}catch(error){}
+ }
  if(webSocketTimer)clearTimeout(webSocketTimer);
  if(webSocket)webSocket.close();
  if(notifyServer&&sessionToken)fetch(relayOrigin+'/api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});

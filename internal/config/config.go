@@ -28,13 +28,17 @@ const MaxCarrierBatchBytes = 2 * 1024 * 1024
 type CarrierMode string
 
 const (
-	CarrierHTTPS      CarrierMode = "https"
-	CarrierHTTPSLanes CarrierMode = "https-lanes"
-	CarrierWebSocket  CarrierMode = "websocket"
+	CarrierHTTPS          CarrierMode = "https"
+	CarrierHTTPSLanes     CarrierMode = "https-lanes"
+	CarrierWebSocket      CarrierMode = "websocket"
+	CarrierWebSocketLanes CarrierMode = "websocket-lanes"
 )
 
 func (m CarrierMode) Valid() bool {
-	return m == CarrierHTTPS || m == CarrierHTTPSLanes || m == CarrierWebSocket
+	return m == CarrierHTTPS ||
+		m == CarrierHTTPSLanes ||
+		m == CarrierWebSocket ||
+		m == CarrierWebSocketLanes
 }
 
 func (m CarrierMode) WithDefault() CarrierMode {
@@ -454,7 +458,7 @@ func loadProfiles(path, host string, limits Limits) ([]Profile, error) {
 		}
 		carrierMode := input.CarrierMode.WithDefault()
 		if !carrierMode.Valid() {
-			return nil, fmt.Errorf("profile %q carrier_mode must be https, https-lanes, or websocket", input.Name)
+			return nil, fmt.Errorf("profile %q carrier_mode must be https, https-lanes, websocket, or websocket-lanes", input.Name)
 		}
 		if err := validateProfileLimits(input.Limits, limits); err != nil {
 			return nil, fmt.Errorf("profile %q: %w", input.Name, err)

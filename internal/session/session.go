@@ -76,19 +76,20 @@ type downBatch struct {
 }
 
 type carrierLane struct {
-	lastUpSequence uint64
-	lastUpDigest   [sha256.Size]byte
-	upActive       bool
-	pendingFrames  []queuedFrame
-	pendingWindows map[uint32]int
-	unacked        []byte
-	unackedCost    int
-	unackedItems   int
-	unackedBase    uint64
-	downCursor     uint64
-	downActive     bool
-	superseded     chan struct{}
-	notify         chan struct{}
+	lastUpSequence  uint64
+	lastUpDigest    [sha256.Size]byte
+	upActive        bool
+	websocketActive bool
+	pendingFrames   []queuedFrame
+	pendingWindows  map[uint32]int
+	unacked         []byte
+	unackedCost     int
+	unackedItems    int
+	unackedBase     uint64
+	downCursor      uint64
+	downActive      bool
+	superseded      chan struct{}
+	notify          chan struct{}
 }
 
 func newCarrierLane() *carrierLane {
@@ -188,8 +189,64 @@ func (s *Session) AcquireWebSocket() bool {
 	return true
 }
 
+func (s *Session) AcquireWebSocketLane(laneID uint32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed ||
+		s.carrier != config.CarrierWebSocketLanes ||
+		laneID == 0 ||
+		laneID > frame.MaxStreamID {
+		return false
+	}
+	if _, closed := s.closedStreams[laneID]; closed {
+		return false
+	}
+	lane := s.carrierLanes[laneID]
+	if lane == nil {
+		if len(s.carrierLanes) >= s.limits.MaxStreamsPerSession {
+			return false
+		}
+		lane = newCarrierLane()
+		s.carrierLanes[laneID] = lane
+	}
+	if lane.websocketActive {
+		return false
+	}
+	lane.websocketActive = true
+	s.lastActivity = time.Now()
+	return true
+}
+
+func (s *Session) ReleaseWebSocketLane(laneID uint32) {
+	var backend *backendStream
+	s.mu.Lock()
+	if s.carrier != config.CarrierWebSocketLanes {
+		s.mu.Unlock()
+		return
+	}
+	lane := s.carrierLanes[laneID]
+	if lane == nil {
+		s.mu.Unlock()
+		return
+	}
+	lane.websocketActive = false
+	if state := s.streams[laneID]; state != nil {
+		s.releaseStreamWritesLocked(state)
+		delete(s.streams, laneID)
+		s.rememberClosedLocked(laneID)
+		backend = state.backend
+	}
+	s.releaseLaneLocked(lane)
+	delete(s.carrierLanes, laneID)
+	s.lastActivity = time.Now()
+	s.mu.Unlock()
+	if backend != nil {
+		backend.close()
+	}
+}
+
 func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
-	if s.carrier == config.CarrierHTTPSLanes {
+	if s.usesCarrierLanes() {
 		return 0, ErrProtocol
 	}
 	digest := sha256.Sum256(body)
@@ -278,7 +335,7 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 }
 
 func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (uint64, error) {
-	if s.carrier != config.CarrierHTTPSLanes || laneID > frame.MaxStreamID {
+	if !s.usesCarrierLanes() || laneID > frame.MaxStreamID {
 		return 0, ErrProtocol
 	}
 	digest := sha256.Sum256(body)
@@ -292,7 +349,7 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 		}
 	}
 	if err != nil {
-		s.protocolFailure()
+		s.laneProtocolFailure(laneID)
 		return 0, ErrProtocol
 	}
 
@@ -316,7 +373,7 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 		}
 		if laneID == 0 || len(frames) == 0 || frames[0].Type != frame.Open {
 			s.mu.Unlock()
-			s.protocolFailure()
+			s.laneProtocolFailure(laneID)
 			return 0, ErrProtocol
 		}
 		lane = newCarrierLane()
@@ -327,14 +384,14 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 		match := bytes.Equal(digest[:], lane.lastUpDigest[:])
 		s.mu.Unlock()
 		if !match {
-			s.protocolFailure()
+			s.laneProtocolFailure(laneID)
 			return 0, ErrProtocol
 		}
 		return sequence, nil
 	}
 	if sequence != lane.lastUpSequence+1 || sequence == 0 {
 		s.mu.Unlock()
-		s.protocolFailure()
+		s.laneProtocolFailure(laneID)
 		return 0, ErrProtocol
 	}
 	if lane.upActive {
@@ -345,7 +402,7 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 	if !s.validateBatchLocked(frames) {
 		lane.upActive = false
 		s.mu.Unlock()
-		s.protocolFailure()
+		s.laneProtocolFailure(laneID)
 		return 0, ErrProtocol
 	}
 	reservedCost, reservedItems := s.backendWriteReservationLocked(frames)
@@ -387,7 +444,7 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 }
 
 func (s *Session) Poll(ctx context.Context, cursor uint64) ([]byte, uint64, error) {
-	if s.carrier == config.CarrierHTTPSLanes {
+	if s.usesCarrierLanes() {
 		return nil, cursor, ErrProtocol
 	}
 	deadline := time.NewTimer(s.timeouts.LongPoll.Value())
@@ -499,7 +556,7 @@ func (s *Session) Poll(ctx context.Context, cursor uint64) ([]byte, uint64, erro
 }
 
 func (s *Session) PollLane(ctx context.Context, laneID uint32, cursor uint64) ([]byte, uint64, bool, error) {
-	if s.carrier != config.CarrierHTTPSLanes || laneID > frame.MaxStreamID {
+	if !s.usesCarrierLanes() || laneID > frame.MaxStreamID {
 		return nil, cursor, false, ErrProtocol
 	}
 	deadline := time.NewTimer(s.timeouts.LongPoll.Value())
@@ -525,7 +582,7 @@ func (s *Session) PollLane(ctx context.Context, laneID uint32, cursor uint64) ([
 		}
 		if cursor != lane.downCursor {
 			s.mu.Unlock()
-			s.protocolFailure()
+			s.laneProtocolFailure(laneID)
 			return nil, cursor, false, ErrProtocol
 		}
 		s.releasePendingLocked(lane.unackedCost, lane.unackedItems)
@@ -534,7 +591,7 @@ func (s *Session) PollLane(ctx context.Context, laneID uint32, cursor uint64) ([
 		lane.unackedItems = 0
 	} else if cursor != lane.downCursor {
 		s.mu.Unlock()
-		s.protocolFailure()
+		s.laneProtocolFailure(laneID)
 		return nil, cursor, false, ErrProtocol
 	}
 	if lane.downActive && lane.superseded != nil {
@@ -976,7 +1033,7 @@ func (s *Session) backendClosed(id uint32, backend *backendStream) {
 }
 
 func (s *Session) queueFrameLocked(t frame.Type, id uint32, payload []byte) bool {
-	if s.carrier == config.CarrierHTTPSLanes {
+	if s.usesCarrierLanes() {
 		return s.queueLaneFrameLocked(t, id, payload)
 	}
 	if t == frame.Window {
@@ -1031,6 +1088,11 @@ func (s *Session) queueFrameLocked(t frame.Type, id uint32, payload []byte) bool
 	}
 	signal(s.notify)
 	return true
+}
+
+func (s *Session) usesCarrierLanes() bool {
+	return s.carrier == config.CarrierHTTPSLanes ||
+		s.carrier == config.CarrierWebSocketLanes
 }
 
 func (s *Session) queueLaneFrameLocked(t frame.Type, id uint32, payload []byte) bool {
@@ -1340,6 +1402,14 @@ func (s *Session) protocolFailure() {
 	s.mu.Lock()
 	s.closeLocked()
 	s.mu.Unlock()
+}
+
+func (s *Session) laneProtocolFailure(laneID uint32) {
+	if s.carrier == config.CarrierWebSocketLanes {
+		s.ReleaseWebSocketLane(laneID)
+	} else {
+		s.protocolFailure()
+	}
 }
 
 func (s *Session) closeLocked() {

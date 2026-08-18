@@ -22,7 +22,10 @@ import (
 	"github.com/telegramdesktop/tproxy-server/internal/session"
 )
 
-const webSocketProtocolPrefix = "tproxy-v1."
+const (
+	webSocketProtocolPrefix     = "tproxy-v1."
+	webSocketLaneProtocolPrefix = "tproxy-lane-v1."
+)
 
 // A create body is a single HELLO frame (8-byte header + 1-byte payload), so a
 // tiny cap is plenty and keeps an unauthenticated POST /session from streaming
@@ -368,17 +371,23 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	protocols := websocket.Subprotocols(r)
-	if len(protocols) != 1 || !strings.HasPrefix(protocols[0], webSocketProtocolPrefix) {
+	if len(protocols) != 1 {
 		s.serveNotFound(w, r)
 		return
 	}
-	token := strings.TrimPrefix(protocols[0], webSocketProtocolPrefix)
+	token, laneID, lanes, ok := webSocketCredentials(protocols[0])
+	if !ok {
+		s.serveNotFound(w, r)
+		return
+	}
 	if _, ok := bearerToken("Bearer " + token); !ok {
 		s.serveNotFound(w, r)
 		return
 	}
 	value, err := s.manager.Get(token)
-	if err != nil || value.CarrierMode() != config.CarrierWebSocket {
+	if err != nil ||
+		(lanes && value.CarrierMode() != config.CarrierWebSocketLanes) ||
+		(!lanes && value.CarrierMode() != config.CarrierWebSocket) {
 		s.serveNotFound(w, r)
 		return
 	}
@@ -386,7 +395,13 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		s.serveNotFound(w, r)
 		return
 	}
-	if !value.AcquireWebSocket() {
+	acquired := false
+	if lanes {
+		acquired = value.AcquireWebSocketLane(laneID)
+	} else {
+		acquired = value.AcquireWebSocket()
+	}
+	if !acquired {
 		s.serveNotFound(w, r)
 		return
 	}
@@ -400,11 +415,19 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	connection, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		value.Close()
+		if lanes {
+			value.ReleaseWebSocketLane(laneID)
+		} else {
+			value.Close()
+		}
 		return
 	}
+	if lanes {
+		defer value.ReleaseWebSocketLane(laneID)
+	} else {
+		defer value.Close()
+	}
 	defer connection.Close()
-	defer value.Close()
 	connection.SetReadLimit(int64(s.config.Limits.MaxBodyBytes))
 	// A dead peer that never sends is otherwise only noticed by the listener's
 	// TCP keep-alive minutes later: bound silence to two long-poll periods,
@@ -418,15 +441,37 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	finished := make(chan error, 2)
-	go s.readWebSocket(ctx, connection, value, idle, finished)
-	go s.writeWebSocket(ctx, connection, value, finished)
+	go s.readWebSocket(ctx, connection, value, laneID, lanes, idle, finished)
+	go s.writeWebSocket(ctx, connection, value, laneID, lanes, finished)
 	<-finished
+}
+
+func webSocketCredentials(protocol string) (string, uint32, bool, bool) {
+	if strings.HasPrefix(protocol, webSocketProtocolPrefix) {
+		token := strings.TrimPrefix(protocol, webSocketProtocolPrefix)
+		return token, 0, false, token != ""
+	}
+	if !strings.HasPrefix(protocol, webSocketLaneProtocolPrefix) {
+		return "", 0, false, false
+	}
+	tokenAndLane := strings.TrimPrefix(protocol, webSocketLaneProtocolPrefix)
+	token, laneText, ok := strings.Cut(tokenAndLane, ".")
+	if !ok || token == "" {
+		return "", 0, false, false
+	}
+	lane, ok := canonicalUint(laneText)
+	if !ok || lane == 0 || lane > frame.MaxStreamID {
+		return "", 0, false, false
+	}
+	return token, uint32(lane), true, true
 }
 
 func (s *Server) readWebSocket(
 	ctx context.Context,
 	connection *websocket.Conn,
 	value *session.Session,
+	laneID uint32,
+	lanes bool,
 	idle time.Duration,
 	finished chan<- error) {
 	sequence := uint64(1)
@@ -443,7 +488,13 @@ func (s *Server) readWebSocket(
 		}
 		deadline := time.NewTimer(30 * time.Second)
 		for {
-			ack, processErr := value.ProcessUp(sequence, body)
+			var ack uint64
+			var processErr error
+			if lanes {
+				ack, processErr = value.ProcessUpLane(laneID, sequence, body)
+			} else {
+				ack, processErr = value.ProcessUp(sequence, body)
+			}
 			if processErr == nil && ack == sequence {
 				if !deadline.Stop() {
 					<-deadline.C
@@ -474,12 +525,29 @@ func (s *Server) writeWebSocket(
 	ctx context.Context,
 	connection *websocket.Conn,
 	value *session.Session,
+	laneID uint32,
+	lanes bool,
 	finished chan<- error) {
 	cursor := uint64(0)
 	for {
-		body, next, err := value.Poll(ctx, cursor)
+		var body []byte
+		var next uint64
+		var laneClosed bool
+		var err error
+		if lanes {
+			body, next, laneClosed, err = value.PollLane(
+				ctx,
+				laneID,
+				cursor)
+		} else {
+			body, next, err = value.Poll(ctx, cursor)
+		}
 		if err != nil {
 			finished <- err
+			return
+		}
+		if laneClosed {
+			finished <- nil
 			return
 		}
 		if err := connection.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {

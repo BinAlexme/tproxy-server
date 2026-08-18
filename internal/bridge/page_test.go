@@ -126,7 +126,12 @@ func TestRenderRejectsInvalidBatch(t *testing.T) {
 }
 
 func TestRenderIncludesSelectableCarrierImplementations(t *testing.T) {
-	for _, mode := range []string{"https", "https-lanes", "websocket"} {
+	for _, mode := range []string{
+		"https",
+		"https-lanes",
+		"websocket",
+		"websocket-lanes",
+	} {
 		page, err := Render("proxy.example.com", "bootstrap-token", mode, 2*1024*1024)
 		if err != nil {
 			t.Fatal(err)
@@ -140,6 +145,11 @@ func TestRenderIncludesSelectableCarrierImplementations(t *testing.T) {
 			"async function pollLane(lane)",
 			"function openWebSocket()",
 			"function runWebSocketUp()",
+			"function openWebSocketLane(lane)",
+			"function runWebSocketLaneUp(lane)",
+			"function finishWebSocketLane(lane,notify)",
+			"finishWebSocketLane(lane,!lane.localClosed&&!lane.remoteClosed)",
+			"new WebSocket(target,'tproxy-lane-v1.'+sessionToken+'.'+lane.id)",
 		} {
 			if !strings.Contains(body, implementation) {
 				t.Fatalf("rendered %s bridge omitted %q", mode, implementation)

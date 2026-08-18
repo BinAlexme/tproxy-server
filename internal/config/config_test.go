@@ -132,6 +132,18 @@ func TestProfileCarrierModeDefaultsAndValidation(t *testing.T) {
 	if err != nil || loaded.Profiles[0].CarrierMode != CarrierHTTPS {
 		t.Fatalf("omitted carrier mode did not default to HTTPS: %#v %v", loaded.Profiles, err)
 	}
+	for _, carrier := range []CarrierMode{
+		CarrierHTTPS,
+		CarrierHTTPSLanes,
+		CarrierWebSocket,
+		CarrierWebSocketLanes,
+	} {
+		writeProfiles(`,"carrier_mode":"` + string(carrier) + `"`)
+		loaded, err := Load(configPath)
+		if err != nil || loaded.Profiles[0].CarrierMode != carrier {
+			t.Fatalf("carrier mode %q was not loaded: %#v %v", carrier, loaded.Profiles, err)
+		}
+	}
 	writeProfiles(`,"carrier_mode":"unknown"`)
 	if _, err := Load(configPath); err == nil {
 		t.Fatal("invalid carrier mode was accepted")

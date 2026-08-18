@@ -24,6 +24,39 @@ import (
 
 const testHost = "proxy.example.com"
 
+func TestWebSocketCredentials(t *testing.T) {
+	token := strings.Repeat("A", 43)
+	tests := []struct {
+		protocol  string
+		wantToken string
+		wantLane  uint32
+		wantLanes bool
+		wantOK    bool
+	}{
+		{webSocketProtocolPrefix + token, token, 0, false, true},
+		{webSocketLaneProtocolPrefix + token + ".17", token, 17, true, true},
+		{webSocketLaneProtocolPrefix + token + ".0", "", 0, false, false},
+		{webSocketLaneProtocolPrefix + token + ".017", "", 0, false, false},
+		{webSocketLaneProtocolPrefix + token + ".16777216", "", 0, false, false},
+		{webSocketLaneProtocolPrefix + token + ".17.extra", "", 0, false, false},
+	}
+	for _, test := range tests {
+		gotToken, gotLane, gotLanes, gotOK := webSocketCredentials(test.protocol)
+		if gotToken != test.wantToken ||
+			gotLane != test.wantLane ||
+			gotLanes != test.wantLanes ||
+			gotOK != test.wantOK {
+			t.Fatalf(
+				"credentials for %q were (%q, %d, %v, %v)",
+				test.protocol,
+				gotToken,
+				gotLane,
+				gotLanes,
+				gotOK)
+		}
+	}
+}
+
 func TestPublicFallbackAndCarrierRoundTrip(t *testing.T) {
 	backend := startEchoBackend(t)
 	application, index := newTestServer(t, backend)
@@ -446,6 +479,140 @@ func TestWebSocketCarrierRoundTrip(t *testing.T) {
 				received = append(received, value.Payload...)
 			}
 		}
+	}
+}
+
+func TestWebSocketLanesRemainIndependent(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierWebSocketLanes
+	})
+	defer application.Shutdown()
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	bootstrap, err := application.manager.IssueBootstrap(
+		&application.config.Profiles[0],
+		"198.51.100.7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := perform(t, hosted.Client(), apiRequest(
+		t,
+		http.MethodPost,
+		hosted.URL+"/api/v1/session",
+		bootstrap,
+		frame.Encode(frame.Hello, 0, []byte{1})))
+	_ = readResponse(t, created)
+	token := created.Header.Get("X-Session-Token")
+	if created.StatusCode != http.StatusOK ||
+		created.Header.Get("X-Carrier-Mode") != string(config.CarrierWebSocketLanes) ||
+		token == "" {
+		t.Fatalf("websocket-lanes session creation failed: status=%d", created.StatusCode)
+	}
+
+	hostedAddress := strings.TrimPrefix(hosted.URL, "http://")
+	dialLane := func(laneID uint32) *websocket.Conn {
+		t.Helper()
+		protocol := webSocketLaneProtocolPrefix + token + "." +
+			strconv.FormatUint(uint64(laneID), 10)
+		dialer := websocket.Dialer{
+			Subprotocols: []string{protocol},
+			NetDialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, hostedAddress)
+			},
+		}
+		headers := http.Header{
+			"Origin":          []string{"https://" + testHost},
+			"X-Forwarded-For": []string{"198.51.100.7"},
+		}
+		connection, response, err := dialer.Dial(
+			"ws://"+testHost+"/api/v1/ws",
+			headers)
+		if err != nil {
+			if response != nil {
+				_ = response.Body.Close()
+			}
+			t.Fatal(err)
+		}
+		if connection.Subprotocol() != protocol {
+			_ = connection.Close()
+			t.Fatal("websocket lane did not authenticate its subprotocol")
+		}
+		return connection
+	}
+	readPayload := func(connection *websocket.Conn, laneID uint32, expected []byte) {
+		t.Helper()
+		_ = connection.SetReadDeadline(time.Now().Add(2 * time.Second))
+		var received []byte
+		for !bytes.Equal(received, expected) {
+			messageType, body, err := connection.ReadMessage()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if messageType != websocket.BinaryMessage {
+				t.Fatalf("unexpected websocket message type %d", messageType)
+			}
+			frames, err := frame.ParseAll(body, frame.MaxPayload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, value := range frames {
+				if value.StreamID != laneID {
+					t.Fatalf("lane %d received stream %d", laneID, value.StreamID)
+				}
+				if value.Type == frame.Data {
+					received = append(received, value.Payload...)
+				}
+			}
+		}
+	}
+
+	firstID := uint32(51)
+	secondID := uint32(52)
+	first := dialLane(firstID)
+	second := dialLane(secondID)
+	defer second.Close()
+	firstPayload := []byte("first websocket lane")
+	secondPayload := []byte("second websocket lane")
+	if err := first.WriteMessage(
+		websocket.BinaryMessage,
+		append(
+			frame.Encode(frame.Open, firstID, nil),
+			frame.Encode(frame.Data, firstID, firstPayload)...)); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.WriteMessage(
+		websocket.BinaryMessage,
+		append(
+			frame.Encode(frame.Open, secondID, nil),
+			frame.Encode(frame.Data, secondID, secondPayload)...)); err != nil {
+		t.Fatal(err)
+	}
+	readPayload(first, firstID, firstPayload)
+	readPayload(second, secondID, secondPayload)
+	if err := first.WriteMessage(
+		websocket.BinaryMessage,
+		frame.Encode(frame.Data, firstID+100, []byte("cross-lane"))); err != nil {
+		t.Fatal(err)
+	}
+	_ = first.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		if _, _, err := first.ReadMessage(); err != nil {
+			break
+		}
+	}
+	_ = first.Close()
+
+	followUp := []byte("still independent")
+	if err := second.WriteMessage(
+		websocket.BinaryMessage,
+		frame.Encode(frame.Data, secondID, followUp)); err != nil {
+		t.Fatal(err)
+	}
+	readPayload(second, secondID, followUp)
+	if _, err := application.manager.Get(token); err != nil {
+		t.Fatal("closing one websocket lane closed the parent session")
 	}
 }
 
