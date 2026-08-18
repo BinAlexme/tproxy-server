@@ -129,7 +129,14 @@ func TestPublicFallbackAndCarrierRoundTrip(t *testing.T) {
 	if cookieResponse.StatusCode != http.StatusNotFound {
 		t.Fatal("carrier API accepted a cookie-bearing request")
 	}
-	created := perform(t, hosted.Client(), apiRequest(t, http.MethodPost, hosted.URL+"/api/v1/session", bootstrap, hello))
+	createRequest := apiRequest(
+		t,
+		http.MethodPost,
+		hosted.URL+"/api/v1/session",
+		bootstrap,
+		hello)
+	createRequest.Header.Set("X-Forwarded-For", "198.51.100.8")
+	created := perform(t, hosted.Client(), createRequest)
 	welcome := readResponse(t, created)
 	if created.StatusCode != http.StatusOK || !bytes.Equal(welcome, frame.Encode(frame.Welcome, 0, nil)) {
 		t.Fatalf("session creation failed: status %d", created.StatusCode)
@@ -139,7 +146,14 @@ func TestPublicFallbackAndCarrierRoundTrip(t *testing.T) {
 		t.Fatal("missing session token")
 	}
 
-	repeated := perform(t, hosted.Client(), apiRequest(t, http.MethodPost, hosted.URL+"/api/v1/session", bootstrap, hello))
+	retryRequest := apiRequest(
+		t,
+		http.MethodPost,
+		hosted.URL+"/api/v1/session",
+		bootstrap,
+		hello)
+	retryRequest.Header.Set("X-Forwarded-For", "198.51.100.9")
+	repeated := perform(t, hosted.Client(), retryRequest)
 	_ = readResponse(t, repeated)
 	if repeated.StatusCode != http.StatusOK || repeated.Header.Get("X-Session-Token") != sessionToken {
 		t.Fatal("bootstrap retry was not idempotent")

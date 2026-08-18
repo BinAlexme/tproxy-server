@@ -363,10 +363,10 @@ well above `long_poll`).
 The relay must receive the original `Host`. The supplied direct-to-origin Caddy
 layout relies on Caddy's default sanitizing of forwarded client addresses; if you
 change trusted-proxy handling, the relay must still receive exactly one IP address
-in `X-Forwarded-For` — the relay binds each bootstrap to that address and rejects
-a request that carries a list or an unparsable value. A dual-stack client that
-switches address family between loading the bridge and creating the session sees
-one 404 and simply retries.
+in `X-Forwarded-For` for capacity accounting, and rejects a request that carries a
+list or an unparsable value. Bootstrap tokens are not bound to that address because
+a browser may use different VPN, carrier, or dual-stack egress connections to load
+the bridge and create its session.
 Do not apply your public site's
 `X-Frame-Options`, COOP, COEP, or framing CSP to the proxied root response; the
 bridge supplies a distinct CSP permitting only the numeric loopback parent.

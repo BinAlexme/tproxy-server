@@ -762,6 +762,8 @@ Additional requirements:
 - store only hashes of bootstrap/session tokens in maps where practical;
 - obtain client IP from Caddy's loopback connection and its single normalized
   forwarding header;
+- do not bind bootstrap authentication to that address because separate browser
+  requests can use different VPN, carrier, or dual-stack egress connections;
 - treat the optional per-IP session and bootstrap ceilings as disabled at zero;
   global limits remain authoritative so carrier-grade NAT does not collapse many
   legitimate users into a default four-session quota;

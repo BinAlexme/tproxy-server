@@ -198,6 +198,12 @@ X-Carrier-Mode: https | https-lanes | websocket | websocket-lanes
 Body: one WELCOME frame
 ```
 
+The bootstrap is a bearer capability rather than a source-address-bound token.
+Browser requests may switch VPN, carrier, load-balancer, or dual-stack egress
+between loading the bridge, creating the session, and retrying that creation.
+The relay still accounts the bootstrap against its issuing address and the
+created session against the address that submits the first valid creation request.
+
 After a valid bootstrap is authenticated, temporary session-capacity or
 creation-rate exhaustion returns `503 Service Unavailable` with `Retry-After: 1`.
 The bootstrap remains unconsumed so the byte-identical creation request can retry.

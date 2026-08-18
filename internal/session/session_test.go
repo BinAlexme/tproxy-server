@@ -716,6 +716,44 @@ func TestBootstrapLimitsExpiryAndConsumption(t *testing.T) {
 	}
 }
 
+func TestBootstrapSurvivesChangingClientAddress(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Limits.MaxBootstrapsPerIP = 1
+	configuration.Limits.MaxSessionsPerIP = 1
+	manager := NewManager(configuration)
+	defer manager.Shutdown()
+	profile := &configuration.Profiles[0]
+	bootstrap, err := manager.IssueBootstrap(profile, "198.51.100.31")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hello := frame.Encode(frame.Hello, 0, []byte{1})
+	created, err := manager.Create(bootstrap, "198.51.100.32", hello)
+	if err != nil {
+		t.Fatalf("rotating egress rejected the bootstrap: %v", err)
+	}
+	retried, err := manager.Create(bootstrap, "198.51.100.33", hello)
+	if err != nil {
+		t.Fatalf("rotating egress rejected an identical retry: %v", err)
+	}
+	if retried.Token != created.Token || retried.Session != created.Session {
+		t.Fatal("rotating-egress retry created a second session")
+	}
+	if _, err := manager.IssueBootstrap(profile, "198.51.100.31"); err != nil {
+		t.Fatalf("consumption did not release the issuing address slot: %v", err)
+	}
+	second, err := manager.IssueBootstrap(profile, "198.51.100.34")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Create(second, "198.51.100.32", hello); !errors.Is(err, ErrLimit) {
+		t.Fatalf("session was not accounted to its creation address: %v", err)
+	}
+	if _, err := manager.Create(second, "198.51.100.35", hello); err != nil {
+		t.Fatalf("an address change could not recover from a per-IP limit: %v", err)
+	}
+}
+
 func TestBootstrapRateIsGlobal(t *testing.T) {
 	configuration := testConfig("127.0.0.1:1")
 	configuration.Limits.MaxBootstrapsPerIP = 10

@@ -33,7 +33,7 @@ type CreateResult struct {
 type bootstrap struct {
 	expires      time.Time
 	profile      *config.Profile
-	clientIP     string
+	issuanceIP   string
 	bodyDigest   [sha256.Size]byte
 	sessionToken string
 	session      *Session
@@ -174,9 +174,9 @@ func (m *Manager) IssueBootstrap(profile *config.Profile, clientIP string) (stri
 		return "", ErrLimit
 	}
 	m.bootstraps[hash] = &bootstrap{
-		expires:  now.Add(m.config.Timeouts.BootstrapLifetime.Value()),
-		profile:  profile,
-		clientIP: clientIP,
+		expires:    now.Add(m.config.Timeouts.BootstrapLifetime.Value()),
+		profile:    profile,
+		issuanceIP: clientIP,
 	}
 	m.bootstrapsPerIP[clientIP]++
 	return token, nil
@@ -196,7 +196,7 @@ func (m *Manager) Create(token, clientIP string, body []byte) (CreateResult, err
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	entry := m.bootstraps[tokenHash]
-	if entry == nil || now.After(entry.expires) || entry.clientIP != clientIP {
+	if entry == nil || now.After(entry.expires) {
 		return CreateResult{}, ErrAuthentication
 	}
 	if entry.used {
@@ -509,9 +509,9 @@ func (m *Manager) releaseUnusedBootstrapLocked(value *bootstrap) {
 	if value.used {
 		return
 	}
-	m.bootstrapsPerIP[value.clientIP]--
-	if m.bootstrapsPerIP[value.clientIP] <= 0 {
-		delete(m.bootstrapsPerIP, value.clientIP)
+	m.bootstrapsPerIP[value.issuanceIP]--
+	if m.bootstrapsPerIP[value.issuanceIP] <= 0 {
+		delete(m.bootstrapsPerIP, value.issuanceIP)
 	}
 }
 
