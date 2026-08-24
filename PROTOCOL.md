@@ -110,11 +110,14 @@ discard them after validation.
 
 ### Hardened WebView execution profile
 
-The reference bridge is deliberately compatible with a private WebView that grants
-the remote document only JavaScript execution and exact-origin network access. It
-uses Fetch, `AbortController`, timers, same-document history replacement, typed
-arrays, and one authenticated native or `MessagePort` boundary. Its HTTPS requests
-use `mode: 'same-origin'`, `credentials: 'omit'`, `cache: 'no-store'`,
+The reference bridge is deliberately compatible with a private WebView whose
+network security contract lets the remote document read or use response data only
+from the exact proxy origin. This is not a guarantee that the browser engine emits
+no off-origin request. Proxy documents must not attempt cross-origin requests;
+clients may block or cancel them, and their network behavior is unspecified. The
+bridge uses Fetch, `AbortController`, timers, same-document history replacement,
+typed arrays, and one authenticated native or `MessagePort` boundary. Its HTTPS
+requests use `mode: 'same-origin'`, `credentials: 'omit'`, `cache: 'no-store'`,
 `redirect: 'error'`, and `referrerPolicy: 'no-referrer'`.
 
 The bridge has no external scripts, styles, fonts, images, frames, objects, media,
@@ -160,9 +163,10 @@ unused by the bridge. It deliberately does not send `X-Frame-Options`, COOP, or
 COEP because those can prevent the loopback parent boundary from working.
 
 These response headers describe and protect the reference implementation. A
-hardened Telegram carrier must independently impose its own navigation, request,
-storage, media, and permission restrictions because a different proxy operator
-controls its own document and response headers.
+hardened Telegram carrier must independently impose its own navigation, response
+isolation, best-effort request blocking, storage, media, and permission
+restrictions because a different proxy operator controls its own document and
+response headers.
 
 ## Carrier modes
 

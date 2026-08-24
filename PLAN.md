@@ -262,9 +262,11 @@ headers because it is a different response.
 
 The page must remain functional with cookies, DOM storage, IndexedDB, Cache
 Storage, workers, service workers, frames, media, downloads, popups, forms, device
-permissions, clipboard access, and cross-origin requests disabled. It uses only
-the nonce-bearing inline script, exact-origin Fetch/WSS, timers, typed arrays,
-same-document history replacement, and its authenticated client boundary.
+permissions, and clipboard access disabled, and without access to cross-origin
+response data. It must not issue cross-origin requests. It uses only the
+nonce-bearing inline script, exact-origin Fetch/WSS, timers, typed arrays,
+same-document history replacement, and its authenticated client boundary. Clients
+may block off-origin requests, but do not promise that the WebView emits none.
 
 Do not put a CDN in front of v1. Long polls, in-memory session affinity, request
 buffering, provider terms, and CDN behavior are separate design work. DNS should

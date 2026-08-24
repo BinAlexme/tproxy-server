@@ -378,6 +378,11 @@ Fetch and optionally same-origin WSS, timers, typed arrays, and the authenticate
 app boundary. It does not use
 cookies or browser storage, external resources, workers, frames, media, popups,
 downloads, forms, device permissions, clipboard APIs, or cross-origin requests.
+Carrier WebViews enforce response isolation, not a guarantee that the browser
+engine emits no off-origin request: provider JavaScript must not be able to read
+or use response data from anywhere except the exact proxy origin. Proxy bridges
+must not attempt cross-origin requests; clients may block or cancel them, and
+their network behavior is unspecified.
 Keep the bridge response headers produced by the Go relay intact; `PROTOCOL.md`
 lists the complete execution policy and explains which restrictions clients must
 also enforce independently.

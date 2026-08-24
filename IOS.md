@@ -137,14 +137,17 @@ style-src 'none';
 worker-src 'none'
 ```
 
-The provider may put its carrier implementation inline, but it cannot load
-external code or resources, create frames/workers, or connect away from exact
-`H`. Also shadow `localStorage`, `sessionStorage`, IndexedDB, Cache Storage,
-workers, `BroadcastChannel`, browser audio constructors, clipboard/device APIs,
-`window.open`, and `document.cookie`. Make `print`, `alert`, `confirm`, and
-`prompt` inert too. The shims are surface reduction; WebKit's CSP and native
-delegates are the security boundary. Do not add `'unsafe-eval'`,
-`blob:`, `data:`, wildcard hosts, alternate ports, or an HTTP source.
+The provider may put its carrier implementation inline, but external code,
+resources, or response data must not become usable by provider JavaScript, and it
+must not create frames or workers. Response data is available only from exact
+`H`; this does not guarantee that `WKWebView` emits no off-origin request, and
+provider documents must not attempt one. Also shadow `localStorage`,
+`sessionStorage`, IndexedDB, Cache Storage, workers, `BroadcastChannel`, browser
+audio constructors, clipboard/device APIs, `window.open`, and `document.cookie`.
+Make `print`, `alert`, `confirm`, and `prompt` inert too. The shims are surface
+reduction; WebKit's CSP and native delegates are the security boundary. Do not add
+`'unsafe-eval'`, `blob:`, `data:`, wildcard hosts, alternate ports, or an HTTP
+source.
 
 Set `mediaTypesRequiringUserActionForPlayback` to all audiovisual media, disable
 AirPlay and picture-in-picture where the platform exposes those switches, keep the

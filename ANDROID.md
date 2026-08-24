@@ -96,13 +96,16 @@ worker-src 'none'
 
 `'unsafe-inline'` is intentional: the provider controls the self-contained carrier
 script. Omitting `'unsafe-eval'`, every resource source, and every origin except
-exact HTTPS/WSS `H` still prevents external code, subframes, workers, media, and
-off-origin traffic. The same document-start script should replace `localStorage`,
-`sessionStorage`, IndexedDB, Cache Storage, workers, `BroadcastChannel`, browser
-audio constructors, clipboard/device APIs, `window.open`, and `document.cookie`
-with nonreplaceable unavailable shims. Replace `print`, `alert`, `confirm`, and
-`prompt` with inert functions as well. These shims reduce exposed surface; the
-CSP and native policy remain the security boundary.
+exact HTTPS/WSS `H` still prevents external code or response data, subframes,
+workers, and media from becoming usable by provider JavaScript. This does not
+guarantee that the WebView emits no off-origin request, and provider documents
+must not attempt one. The same document-start script should replace
+`localStorage`, `sessionStorage`, IndexedDB, Cache Storage, workers,
+`BroadcastChannel`, browser audio constructors, clipboard/device APIs,
+`window.open`, and `document.cookie` with nonreplaceable unavailable shims.
+Replace `print`, `alert`, `confirm`, and `prompt` with inert functions as well.
+These shims reduce exposed surface; the CSP and native policy remain the security
+boundary.
 
 Configure the carrier instance as follows:
 
