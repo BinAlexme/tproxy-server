@@ -1,0 +1,290 @@
+# Установка Telegram Web Proxy на свой VPS
+
+В проекте используются:
+
+- MTProxy
+- `tproxy-server`
+- Caddy
+- HTTPS-сертификат
+- systemd
+- HTML-заглушка
+
+
+# Автоматическая установка 
+
+В терминале выполняем команду:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BinAlexme/tproxy-server/refs/heads/master/install-webproxy.sh -o /root/install-webproxy.sh && chmod +x /root/install-webproxy.sh && /root/install-webproxy.sh
+```
+
+После запуска попросит установщик вести данные (Обязательно правильные):
+
+```text
+Domain (example: proxy.example.com):
+ACME email (example: admin@example.com):
+Generate a secure secret automatically? [Y/n]:
+```
+
+Например:
+
+```text
+Domain (example: proxy.example.com): proxy.example.com
+ACME email (example: admin@example.com): admin@example.com
+Generate a secure secret automatically? [Y/n]: y
+```
+
+Дальше автоматическая установка.
+
+---
+
+# Что делает установщик
+
+Скрипт:
+
+```text
+Проверяет систему
+        ↓
+Проверяет DNS
+        ↓
+Проверяет порты 80/443
+        ↓
+Устанавливает зависимости
+        ↓
+Создаёт сайт-заглушку
+        ↓
+Устанавливает MTProxy
+        ↓
+Собирает tproxy-server
+        ↓
+Настраивает systemd
+        ↓
+Настраивает Caddy
+        ↓
+Получает HTTPS-сертификат
+        ↓
+Запускает сервисы
+        ↓
+Проверяет MTProxy :2398
+        ↓
+Проверяет relay /readyz
+        ↓
+Проверяет /healthz
+        ↓
+Ждёт HTTPS до 120 секунд
+        ↓
+Проверяет HTTPS
+        ↓
+Показывает Telegram Web Proxy
+```
+
+---
+
+# В конце:
+
+После успешной установки:
+
+```text
+============================================================
+             TELEGRAM WEB PROXY IS READY
+============================================================
+
+Domain:
+  https://proxy.example.com/
+
+Secret:
+  ******************************
+
+Telegram Web Proxy:
+  https://t.me/webproxy?server=proxy.example.com&secret=************************
+
+
+Status:
+  HTTPS          OK
+  MTProxy        ACTIVE
+  Relay          READY
+  Firewall       ACTIVE
+============================================================
+```
+
+**Secret никому не передавайте.**
+
+---
+
+# 5. Полное удаление установщика
+
+Для удаления Telegram Web Proxy используйте:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BinAlexme/tproxy-server/refs/heads/master/uninstall-webproxy.sh -o /tmp/uninstall-webproxy.sh && chmod +x /tmp/uninstall-webproxy.sh && /tmp/uninstall-webproxy.sh
+```
+
+Попросит подтвердить удаление:
+
+```text
+REMOVE
+```
+
+После этого будут удалены все компоненты.
+
+---
+
+
+# Замена HTML-заглушки
+
+Находится здесь:
+
+```bash
+/srv/tproxy-site/index.html
+```
+
+Открыть:
+
+```bash
+nano /srv/tproxy-site/index.html
+```
+
+Можно заменить HTML на свой.
+
+Сохранить файл 
+Ctrl+O
+Enter
+Ctrl+X
+
+После изменения:
+
+```bash
+chown -R root:root /srv/tproxy-site
+find /srv/tproxy-site -type d -exec chmod 0755 {} \;
+find /srv/tproxy-site -type f -exec chmod 0644 {} \;
+```
+
+После этого обновите страницу в браузере.
+
+Caddy перезапускать не требуется.
+
+---
+
+# Пример HTML-заглушки
+
+Пример страницы:
+
+```html
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Подключение</title>
+
+    <style>
+        :root {
+            color-scheme: dark;
+            --bg: #0a0d12;
+            --card: #11161f;
+            --text: #f5f7fb;
+            --muted: #8f99a8;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            padding: 24px;
+            background: var(--bg);
+            color: var(--text);
+            font-family: system-ui, sans-serif;
+        }
+
+        .card {
+            width: min(100%, 560px);
+            padding: 38px 30px;
+            text-align: center;
+            background: var(--card);
+            border: 1px solid #242c38;
+            border-radius: 22px;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 32px;
+        }
+
+        p {
+            color: var(--muted);
+        }
+
+        .loader {
+            width: min(100%, 320px);
+            height: 8px;
+            margin: 28px auto;
+            overflow: hidden;
+            border-radius: 999px;
+            background: #202733;
+        }
+
+        .loader::before {
+            content: "";
+            display: block;
+            width: 34%;
+            height: 100%;
+            background: #fff;
+            border-radius: inherit;
+            animation: loading 1.25s ease-in-out infinite;
+        }
+
+        @keyframes loading {
+            0% {
+                transform: translateX(-120%);
+            }
+
+            50% {
+                transform: translateX(190%);
+            }
+
+            100% {
+                transform: translateX(320%);
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+<main class="card">
+    <h1>Подключение</h1>
+
+    <p>
+        Пожалуйста, подождите.<br>
+        Идёт загрузка страницы.
+    </p>
+
+    <div class="loader"></div>
+</main>
+
+</body>
+</html>
+```
+
+---
+
+
+
+
+# Обязательно порт 80 или 443 должны быть открыты перед работой
+
+Проверьте:
+
+```bash
+ss -lntp | grep -E ':(80|443)\b'
+```
+
+Установщик специально останавливается, если эти порты уже заняты.
+
+---
