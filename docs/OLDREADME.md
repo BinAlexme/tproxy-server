@@ -16,8 +16,8 @@ Telegram Desktop implementation, an experimental Android client described in
 the same bridge page, carrier selection, shared frame format, and server deployment.
 
 The configured hostname remains a regular HTTPS website. A capability derived from
-the hostname and MTProxy secret selects a one-shot bridge page; every other normal
-request receives the public site.
+the hostname and MTProxy secret selects a one-shot bridge page. Requests without
+authentic relay credentials receive the public site.
 
 ## How it works
 
@@ -69,7 +69,7 @@ official MTProxy client port, and MTProxy statistics remain local. The relay nev
 receives a client-selected backend address and never decrypts the MTProxy stream.
 
 Caddy proxies **every** path to the relay. In static mode the relay serves the
-whole site from memory through one code path and one header set. In application
+whole site from memory using standard Go conditional and range handling. In application
 mode it delegates ordinary and unauthenticated requests to one private loopback
 web application. A request that proves knowledge of a bridge or session token is
 intercepted before that application. In either mode there is no separately hosted
@@ -128,20 +128,22 @@ entered in every client that uses this server and passed to the installer.
 
 The repository deliberately does not include a deployable public website. If many
 operators installed the same starter, its body and assets would become an easy
-active-probing signature. The simplest choice is a static site that genuinely
-belongs to the operator, with generated files in a directory such as `../my-site`.
+active-probing signature. The recommended choice is a real loopback website or
+stock static server configured with `public_upstream`. The in-process `public_dir`
+mode remains available for simple sites.
 
 The only required file is `index.html`. A several-page site will normally also
 have `about.html`, `privacy.html`, `404.html`, `styles.css`, a favicon, and images.
-The relay supports clean links such as `/about` for `about.html`; no framework or
-build step is required. See [`PUBLIC_SITE.md`](PUBLIC_SITE.md) for the complete
+Use exact links such as `/about.html`, or explicitly select `static_routes: "legacy"`
+for extensionless aliases. Old configs retain those aliases for compatibility. See [`PUBLIC_SITE.md`](PUBLIC_SITE.md) for the complete
 package contract and a prompt suitable for a site generator.
 
 For a database-backed site, accounts, forms, server rendering, an existing CMS,
 site APIs, SSE, or WebSockets, run any HTTP application on a numeric loopback
 address such as `127.0.0.1:3000`. The relay can use it as `public_upstream` while
 remaining the only public gateway. The application owns its framework, headers,
-cookies, and persistence; four exact transport paths remain reserved. This mode
+cookies, and persistence; unauthenticated requests on transport paths reach the
+application unchanged apart from normal HTTP proxy semantics. This mode
 is specified in [`PUBLIC_SITE.md`](PUBLIC_SITE.md).
 
 ## 3. Configure the hosting firewall
@@ -340,13 +342,23 @@ web application as described in [`PUBLIC_SITE.md`](PUBLIC_SITE.md), then create
 `config.example.json` and `profiles.example.json`. When not using systemd
 `LoadCredential`, point `profiles_file` directly at the mode-restricted file. Both
 relay listeners, the public application, and every backend address must use
-numeric loopback addresses.
+numeric loopback addresses. Provision the persistent signing key once (the
+`tproxy` service user and `/etc/tproxy-server` must already exist):
+
+```bash
+sudo bash deploy/ensure-token-key.sh
+```
+
+Keep `/etc/tproxy-server/token.key` backed up, private, and unchanged across
+restarts. `token_key_file` defaults to `token.key` next to the server config. A
+missing or permissive key fails startup; no ephemeral key is silently generated.
 
 Build the official backend with `deploy/install-mtproxy.sh`, install the supplied
 systemd units, and let the relay serve the whole hostname:
 
 ```caddyfile
 encode zstd gzip
+header -Via
 reverse_proxy 127.0.0.1:8080 {
   transport http {
     response_header_timeout 40s
@@ -434,6 +446,16 @@ client secret, and numeric loopback backend:
 The mode is selected through the secret/profile, so existing Desktop, Android, and
 iOS proof-of-concept clients need no new setting or client-side transport code. Use
 different secrets when exposing several modes on one hostname.
+
+macOS WebKit can serialize WebSocket handshakes to the same host. With
+`websocket-lanes`, a burst of main, media, and connection-test streams can therefore
+take longer to open than the client's connection timeout. The bridge cancels a
+pending handshake when the client closes that stream, but each remaining lane
+still needs its own handshake. If connection establishment is slow or media
+streams keep reconnecting, use `"carrier_mode": "websocket"` in the affected
+profile in `/etc/tproxy-server/profiles.json`, then run
+`sudo systemctl restart tproxy-server`. Clients reconnect using the new mode with
+the same hostname and secret; the public website configuration needs no change.
 
 Run one official MTProxy process and listener per profile when profiles need
 separate quotas or routing. Extend `firewall.nft` to include every added backend
@@ -558,10 +580,22 @@ when the old deployment was ready, backend readiness; a failure automatically ro
 back to the previous binary. Existing carrier sessions are invalidated; clients
 must obtain a fresh bridge page and relay session automatically.
 
-This script intentionally does not replace configuration, systemd units, Caddy,
-MTProxy, firewall rules, or public-site files. Running the complete automated
+The updater provisions a missing default `token.key` without changing existing
+config JSON, so an older binary can still be restored. On that first migration it
+also installs a dedicated systemd environment drop-in to drain legacy tokens
+safely. Remove the drop-in once existing clients have reloaded, as described in
+[HARDENING.md](HARDENING.md), to enable complete public pass-through. Existing key
+bytes are preserved. For a custom `token_key_file`, provision that path and arrange
+legacy draining separately.
+
+Apart from the first-migration drop-in, this script does not replace configuration,
+systemd units, Caddy, MTProxy, firewall rules, or public-site files. Running the complete automated
 installer again preserves an existing site directory but replaces the single-profile
 config and active Caddyfile, so use it deliberately.
+
+The probing-hardening change also has a separate Caddy migration; see
+[HARDENING.md](HARDENING.md) for the reviewed changes, token rollout limitations,
+and verification commands. Do not rerun the full installer just to update Caddy.
 
 When an update includes reviewed changes to the supplied relay or MTProxy unit,
 install those units separately and then restart the affected services:

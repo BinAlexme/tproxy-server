@@ -1,12 +1,10 @@
 package session
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -65,7 +63,8 @@ type Capacity struct {
 }
 
 type Manager struct {
-	config config.Config
+	config   config.Config
+	tokenKey [sha256.Size]byte
 
 	mu                   sync.Mutex
 	bootstraps           map[[sha256.Size]byte]*bootstrap
@@ -99,13 +98,14 @@ type Manager struct {
 	limitHits           atomic.Uint64
 }
 
-func NewManager(value config.Config) *Manager {
+func NewManager(value config.Config, tokenKey [sha256.Size]byte) *Manager {
 	for i := range value.Profiles {
 		value.Profiles[i].CarrierMode = value.Profiles[i].CarrierMode.WithDefault()
 		value.Profiles[i].Limits = value.Profiles[i].Limits.WithDefaults(value.Limits)
 	}
 	result := &Manager{
 		config:              value,
+		tokenKey:            tokenKey,
 		bootstraps:          make(map[[sha256.Size]byte]*bootstrap),
 		bootstrapsPerIP:     make(map[string]int),
 		sessions:            make(map[[sha256.Size]byte]*Session),
@@ -149,7 +149,7 @@ func (m *Manager) IssueBootstrap(profile *config.Profile, clientIP string) (stri
 		return "", ErrAuthentication
 	}
 	now := time.Now()
-	token, hash, err := newToken()
+	token, hash, err := m.newToken(TokenBootstrap)
 	if err != nil {
 		return "", err
 	}
@@ -230,7 +230,7 @@ func (m *Manager) Create(token, clientIP string, body []byte) (CreateResult, err
 		m.limitHits.Add(1)
 		return CreateResult{}, ErrLimit
 	}
-	sessionToken, sessionHash, err := newToken()
+	sessionToken, sessionHash, err := m.newToken(TokenSession)
 	if err != nil {
 		return CreateResult{}, err
 	}
@@ -639,15 +639,6 @@ func (m *Manager) removeExpiredBootstrapsLocked(now time.Time) {
 			delete(m.closedTokens, hash)
 		}
 	}
-}
-
-func newToken() (string, [sha256.Size]byte, error) {
-	var input [32]byte
-	if _, err := rand.Read(input[:]); err != nil {
-		return "", [sha256.Size]byte{}, fmt.Errorf("random token: %w", err)
-	}
-	text := base64.RawURLEncoding.EncodeToString(input[:])
-	return text, sha256.Sum256(input[:]), nil
 }
 
 func tokenHash(token string) ([sha256.Size]byte, error) {

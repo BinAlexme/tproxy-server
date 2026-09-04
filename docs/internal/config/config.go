@@ -105,16 +105,19 @@ type Timeouts struct {
 }
 
 type Config struct {
-	PublicHostname string    `json:"public_hostname"`
-	Listen         string    `json:"listen"`
-	AdminListen    string    `json:"admin_listen"`
-	PublicDir      string    `json:"public_dir"`
-	PublicUpstream string    `json:"public_upstream"`
-	ProfilesFile   string    `json:"profiles_file"`
-	EnablePprof    bool      `json:"enable_pprof"`
-	Limits         Limits    `json:"limits"`
-	Timeouts       Timeouts  `json:"timeouts"`
-	Profiles       []Profile `json:"-"`
+	PublicHostname   string    `json:"public_hostname"`
+	Listen           string    `json:"listen"`
+	AdminListen      string    `json:"admin_listen"`
+	PublicDir        string    `json:"public_dir"`
+	PublicUpstream   string    `json:"public_upstream"`
+	StaticRoutes     string    `json:"static_routes"`
+	TokenKeyFile     string    `json:"token_key_file"`
+	ProfilesFile     string    `json:"profiles_file"`
+	EnablePprof      bool      `json:"enable_pprof"`
+	Limits           Limits    `json:"limits"`
+	Timeouts         Timeouts  `json:"timeouts"`
+	Profiles         []Profile `json:"-"`
+	LegacyTokenDrain bool      `json:"-"`
 }
 
 type profileFile struct {
@@ -187,8 +190,10 @@ func (limits ProfileLimits) WithDefaults(global Limits) ProfileLimits {
 
 func Defaults() Config {
 	return Config{
-		Listen:      "127.0.0.1:8080",
-		AdminListen: "127.0.0.1:8081",
+		Listen:       "127.0.0.1:8080",
+		AdminListen:  "127.0.0.1:8081",
+		StaticRoutes: "legacy",
+		TokenKeyFile: "token.key",
 		Limits: Limits{
 			MaxHeaderBytes:            16 * 1024,
 			MaxBodyBytes:              2 * 1024 * 1024,
@@ -246,6 +251,9 @@ func Load(path string, profilesOverride ...string) (Config, error) {
 	if result.ProfilesFile != "" && !filepath.IsAbs(result.ProfilesFile) {
 		result.ProfilesFile = filepath.Join(filepath.Dir(path), result.ProfilesFile)
 	}
+	if !filepath.IsAbs(result.TokenKeyFile) {
+		result.TokenKeyFile = filepath.Join(filepath.Dir(path), result.TokenKeyFile)
+	}
 	if len(profilesOverride) > 1 {
 		return Config{}, errors.New("only one profiles override is allowed")
 	}
@@ -264,6 +272,9 @@ func Load(path string, profilesOverride ...string) (Config, error) {
 }
 
 func (c Config) validate() error {
+	if c.StaticRoutes != "exact" && c.StaticRoutes != "legacy" {
+		return errors.New("static_routes must be exact or legacy")
+	}
 	if err := ValidateHostname(c.PublicHostname); err != nil {
 		return fmt.Errorf("public_hostname: %w", err)
 	}

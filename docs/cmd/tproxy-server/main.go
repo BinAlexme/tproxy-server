@@ -27,6 +27,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("configuration error: %v", err)
 	}
+	value.LegacyTokenDrain = os.Getenv("TPROXY_LEGACY_TOKEN_DRAIN") == "1"
 	if err := session.ValidateBudget(value); err != nil {
 		log.Fatalf("configuration error: %v", err)
 	}
@@ -72,7 +73,7 @@ func main() {
 	errors := make(chan error, 2)
 	go func() { errors <- publicHTTP.Serve(publicListener) }()
 	go func() { errors <- adminHTTP.Serve(adminListener) }()
-	log.Printf("event=started public=%s admin=%s profiles=%d", value.Listen, value.AdminListen, len(value.Profiles))
+	log.Printf("event=started public=%s admin=%s profiles=%d legacy_token_drain=%t", value.Listen, value.AdminListen, len(value.Profiles), value.LegacyTokenDrain)
 
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)

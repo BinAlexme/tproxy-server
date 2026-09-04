@@ -31,7 +31,9 @@ Vectors:
 | `proxy.example.com` | `dd000102030405060708090a0b0c0d0e0f` | `IpJrt3e7sKtzPyoXy6w-Zj6GGEvsvclN66JzQEfPYLA` |
 
 Only an exact `GET /` with one canonical 43-character `bridge` parameter selects
-the bridge. Every other root query returns the normal public index.
+the bridge. Requests with no authentic relay secret follow the public website.
+An authentic capability in a noncanonical query or on the wrong path fails
+locally with an uncacheable 404, without exposing it to the public application.
 
 `tdesktop-web-proxy-bridge-v1` is a frozen v1 domain-separation label. Its name is
 retained for compatibility and does not restrict the protocol to Telegram Desktop.
@@ -184,11 +186,11 @@ cookie-bearing HTTP API request; the WebSocket upgrade is exempt because a
 browser's `WebSocket` constructor cannot omit cookies the site may have set.
 Binary HTTP bodies use exactly `Content-Type: application/octet-stream`.
 
-Every request that does not authenticate — unknown bearer, wrong method, malformed
-headers — is answered before the request body is touched, with
-the exact response an unknown static path receives, and any body a client sends is
-read (or discarded) under a bounded deadline. A create body is a single `HELLO`
-frame, so the relay caps it at 64 bytes.
+Requests with no authentic secret follow the ordinary public handler, including
+the original request body and random bearer values. Authentic tokens used with a
+wrong method, malformed headers, or missing session state fail locally with an
+uncacheable 404. Their bodies remain under the carrier read deadline. A create
+body is a single `HELLO` frame, so the relay caps it at 64 bytes.
 
 Session creation exchanges a two-minute bootstrap token atomically and
 idempotently:
@@ -214,6 +216,23 @@ created session against the address that submits the first valid creation reques
 After a valid bootstrap is authenticated, temporary session-capacity or
 creation-rate exhaustion returns `503 Service Unavailable` with `Retry-After: 1`.
 The bootstrap remains unconsumed so the byte-identical creation request can retry.
+
+### Token representation and restart behavior
+
+Bootstrap and session tokens remain opaque 32-byte values encoded as 43 canonical
+unpadded base64url characters. Their server-side layout is now a 16-byte random
+nonce followed by a 16-byte truncated HMAC-SHA256. The MAC input is
+`"tproxy-server-token-v1\x00" || kind || nonce`, where kind is byte 1 for bootstrap
+and byte 2 for session. The independent 32-byte signing key persists across relay
+restarts. Clients must not interpret the layout; all existing endpoint names,
+headers, capability derivation, and four carrier modes are unchanged.
+
+A valid MAC establishes provenance only. Session state, bootstrap expiry, replay,
+method, body, and capacity checks still authorize each operation. A restart
+invalidates live state as before; clients reload the bridge and recreate streams.
+Signed expired or wrong-kind tokens are rejected locally, never delegated to the
+website. Pre-migration random tokens have no verifiable provenance after restart;
+see [HARDENING.md](HARDENING.md) before the first rollout.
 
 ### Serialized HTTPS
 
@@ -363,9 +382,9 @@ trade the improved isolation for additional WebSocket/TLS setup, connections, an
 server resources.
 
 `DELETE /api/v1/session` with the session bearer closes all streams and is
-idempotent for a currently authenticated session. Tokens are 32 random bytes in
-canonical unpadded base64url form. Missing or invalid credentials receive the
-site's ordinary 404 response.
+idempotent for a currently authenticated session. Tokens use the opaque signed
+representation described above. Missing or random credentials follow the public
+website; authentic but unusable credentials receive a local uncacheable 404.
 
 ## Shared frames
 

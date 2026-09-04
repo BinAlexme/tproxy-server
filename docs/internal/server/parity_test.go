@@ -115,15 +115,6 @@ func TestProbingParityAcrossAPIAndStaticPaths(t *testing.T) {
 			for _, query := range rootQueries {
 				got := fingerprint(t, method, "/"+query, decorate)
 				want := rootReference
-				if query != "" && (method == http.MethodGet || method == http.MethodHead) {
-					want = fingerprint(t, method, "/about"+query, decorate)
-					if want.status != http.StatusNotFound {
-						want = rootReference
-					}
-					want.headers = strings.Replace(rootReference.headers, "Cache-Control: public, max-age=300", "Cache-Control: no-store", 1)
-					want.status = rootReference.status
-					want.body = rootReference.body
-				}
 				if got.status != want.status || got.headers != want.headers || !bytes.Equal(got.body, want.body) {
 					t.Fatalf("%s /%s (%s) differs from %s /:\n%d\n%s\nvs\n%d\n%s", method, query, name, method, got.status, got.headers, want.status, want.headers)
 				}
@@ -131,8 +122,7 @@ func TestProbingParityAcrossAPIAndStaticPaths(t *testing.T) {
 		}
 	}
 
-	// Statics resolve like the former front-proxy rules and carry the same
-	// header set as the index and the 404 body.
+	// Old configurations retain their deployed static aliases.
 	about := fingerprint(t, http.MethodGet, "/about", nil)
 	if about.status != http.StatusOK || !bytes.Contains(about.body, []byte("About")) {
 		t.Fatalf("/about did not resolve to about.html: %d", about.status)
@@ -141,14 +131,9 @@ func TestProbingParityAcrossAPIAndStaticPaths(t *testing.T) {
 	if favicon.status != http.StatusOK || !strings.Contains(favicon.headers, "Content-Type: image/svg+xml") {
 		t.Fatalf("/favicon.ico did not resolve to favicon.svg: %d\n%s", favicon.status, favicon.headers)
 	}
-	for _, name := range []string{"Etag", "Accept-Ranges"} {
-		if strings.Contains(about.headers, name+":") {
-			t.Fatalf("static entries must not emit %s", name)
-		}
-	}
 	root := fingerprint(t, http.MethodGet, "/", nil)
-	if strings.Replace(about.headers, "Content-Length: "+fmt.Sprint(len(about.body)), "", 1) != strings.Replace(root.headers, "Content-Length: "+fmt.Sprint(len(root.body)), "", 1) {
-		t.Fatalf("static and index header sets differ:\n%s\nvs\n%s", about.headers, root.headers)
+	if !strings.Contains(about.headers, "Accept-Ranges: bytes") || !strings.Contains(about.headers, "Etag:") {
+		t.Fatal("static entries omitted standard range or conditional headers")
 	}
 	conditional := request(t, http.MethodGet, hosted.URL+"/about", nil, "")
 	conditional.Header.Set("If-Modified-Since", time.Now().Add(time.Hour).UTC().Format(http.TimeFormat))
@@ -161,8 +146,8 @@ func TestProbingParityAcrossAPIAndStaticPaths(t *testing.T) {
 	if traversal.status != http.StatusNotFound && traversal.status != http.StatusOK {
 		t.Fatalf("path traversal returned %d", traversal.status)
 	}
-	if !strings.Contains(root.headers, "worker-src 'none'") {
-		t.Fatal("public CSP does not deny workers")
+	if strings.Contains(root.headers, "Content-Security-Policy:") {
+		t.Fatal("public response unexpectedly imposes a shared CSP")
 	}
 	withPort := request(t, http.MethodGet, hosted.URL+"/", nil, "")
 	withPort.Host = testHost + ":443"
@@ -172,11 +157,10 @@ func TestProbingParityAcrossAPIAndStaticPaths(t *testing.T) {
 	}
 }
 
-// A valid capability under limits, and a valid capability with a rejected
-// bootstrap, must fall back to the ordinary uncacheable `GET /?...` shape.
-func TestBridgeFallbackMatchesQueriedIndex(t *testing.T) {
+// A failed authenticated bridge request must never enter public-site routing.
+func TestBridgeLimitFailsLocally(t *testing.T) {
 	backend := startEchoBackend(t)
-	application, index := newConfiguredTestServer(t, backend, func(value *config.Config) {
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
 		value.Limits.MaxBootstrapsGlobal = 1
 		value.Limits.NewBootstrapsBurst = 1
 		value.Limits.NewBootstrapsPerMinute = 1
@@ -193,17 +177,13 @@ func TestBridgeFallbackMatchesQueriedIndex(t *testing.T) {
 	}
 	second := perform(t, hosted.Client(), request(t, http.MethodGet, hosted.URL+"/?bridge="+url.QueryEscape(capability), nil, ""))
 	body := readResponse(t, second)
-	if second.StatusCode != http.StatusOK || !bytes.Equal(body, index) {
-		t.Fatalf("rate-limited bridge request did not fall back to the index: %d", second.StatusCode)
+	if second.StatusCode != http.StatusNotFound || bytes.Contains(body, []byte("tproxy-init")) {
+		t.Fatalf("rate-limited bridge request did not fail locally: %d", second.StatusCode)
 	}
 	if second.Header.Get("Cache-Control") != "no-store" {
-		t.Fatalf("queried index fallback is cacheable: %q", second.Header.Get("Cache-Control"))
+		t.Fatalf("authenticated bridge failure is cacheable: %q", second.Header.Get("Cache-Control"))
 	}
-	queried := perform(t, hosted.Client(), request(t, http.MethodGet, hosted.URL+"/?x=1", nil, ""))
-	_ = readResponse(t, queried)
-	if queried.Header.Get("Cache-Control") != "no-store" || queried.Header.Get("Content-Security-Policy") != second.Header.Get("Content-Security-Policy") {
-		t.Fatal("/?x=1 and a fallen-back /?bridge= differ in cache or CSP headers")
-	}
+
 }
 
 func TestSessionCreateAuthenticatesBeforeReadingBody(t *testing.T) {
@@ -214,8 +194,13 @@ func TestSessionCreateAuthenticatesBeforeReadingBody(t *testing.T) {
 	hosted := httptest.NewServer(application.Handler())
 	defer hosted.Close()
 
+	misplaced, err := application.manager.IssueBootstrap(&application.config.Profiles[0], "198.51.100.7")
+	if err != nil {
+		t.Fatal(err)
+	}
 	reader, writer := io.Pipe()
-	unknown, err := http.NewRequest(http.MethodPost, hosted.URL+"/api/v1/session", reader)
+	defer writer.Close()
+	unknown, err := http.NewRequest(http.MethodPost, hosted.URL+"/wrong-path", reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +209,7 @@ func TestSessionCreateAuthenticatesBeforeReadingBody(t *testing.T) {
 	unknown.Header.Set("X-Forwarded-For", "198.51.100.7")
 	unknown.Header.Set("Origin", "https://"+testHost)
 	unknown.Header.Set("Content-Type", "application/octet-stream")
-	unknown.Header.Set("Authorization", "Bearer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+	unknown.Header.Set("Authorization", "Bearer "+misplaced)
 	done := make(chan *http.Response, 1)
 	go func() {
 		response, err := hosted.Client().Do(unknown)
@@ -234,8 +219,8 @@ func TestSessionCreateAuthenticatesBeforeReadingBody(t *testing.T) {
 		}
 		done <- response
 	}()
-	// The relay rejects the unknown bearer without reading the body, and the
-	// per-request read deadline bounds how long net/http may spend discarding
+	// The relay rejects the misplaced authentic bearer without reading the
+	// body. The read deadline bounds how long net/http may spend discarding
 	// the never-completing body before the 404 leaves.
 	select {
 	case response := <-done:
@@ -244,15 +229,14 @@ func TestSessionCreateAuthenticatesBeforeReadingBody(t *testing.T) {
 		}
 		_ = readResponse(t, response)
 		if response.StatusCode != http.StatusNotFound {
-			t.Fatalf("unknown bearer with an unfinished body got %d, want 404", response.StatusCode)
+			t.Fatalf("misplaced authentic bearer with an unfinished body got %d, want 404", response.StatusCode)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("unknown bearer was allowed to hold the connection while its body never completes")
+		t.Fatal("misplaced authentic bearer was allowed to hold the connection while its body never completes")
 	}
 	_ = writer.Close()
 
-	// A known bootstrap with a slow body must be cut by the read deadline
-	// rather than held forever; the create body cap is tiny.
+	// A known bootstrap retains the tiny session-create body cap.
 	secret, _ := hex.DecodeString("000102030405060708090a0b0c0d0e0f")
 	capability := config.CapabilityString(config.DeriveCapability(testHost, secret))
 	bridge := perform(t, hosted.Client(), request(t, http.MethodGet, hosted.URL+"/?bridge="+url.QueryEscape(capability), nil, ""))
@@ -349,7 +333,7 @@ func TestConcurrentUplinkIsRetryableAndDownlinkSupersedes(t *testing.T) {
 	}
 
 	// A racing /up (retry while the previous parse is still in flight) is a
-	// retryable 503, not the fatal public 404.
+	// retryable 503, not the fatal local 404.
 	value, err := application.manager.Get(token)
 	if err != nil {
 		t.Fatal(err)
@@ -385,7 +369,7 @@ func TestStaticSiteLoadsWholeTree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if site.resolve("/assets/app.css") == nil || site.resolve("/assets/../index.html") != nil || site.resolve("/index") == nil || site.resolve("/") != nil {
+	if site.resolve("/assets/app.css", true) == nil || site.resolve("/assets/../index.html", true) != nil || site.resolve("/index", true) == nil || site.resolve("/", true) != nil {
 		t.Fatal("static resolution does not follow the front-proxy rules")
 	}
 	if site.notFound != site.index {

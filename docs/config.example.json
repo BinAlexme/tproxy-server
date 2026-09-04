@@ -2,7 +2,9 @@
   "public_hostname": "proxy.example.com",
   "listen": "127.0.0.1:8080",
   "admin_listen": "127.0.0.1:8081",
-  "public_dir": "/srv/tproxy-site",
+  "public_upstream": "http://127.0.0.1:3000",
+  "token_key_file": "/etc/tproxy-server/token.key",
+  "static_routes": "exact",
   "profiles_file": "/run/credentials/tproxy-server.service/profiles.json",
   "enable_pprof": false,
   "limits": {

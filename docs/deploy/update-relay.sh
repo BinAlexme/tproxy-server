@@ -95,6 +95,23 @@ echo "Building relay candidate with $go_binary"
 	-trimpath -ldflags='-s -w' -o "$candidate" ./cmd/tproxy-server)
 
 echo "Validating candidate against the installed configuration"
+if [[ ! -e /etc/tproxy-server/token.key ]]; then
+	migration_directory=/etc/systemd/system/tproxy-server.service.d
+	migration_dropin="$migration_directory/token-migration.conf"
+	install -d -m 0755 "$migration_directory"
+	cat > "$temporary/token-migration.conf" <<EOF
+[Service]
+Environment=TPROXY_LEGACY_TOKEN_DRAIN=1
+EOF
+	if [[ -L "$migration_dropin" ]] || { [[ -e "$migration_dropin" ]] && ! cmp -s "$temporary/token-migration.conf" "$migration_dropin"; }; then
+		echo "Existing $migration_dropin differs; configure legacy draining explicitly before updating" >&2
+		exit 1
+	fi
+	install -o root -g root -m 0644 "$temporary/token-migration.conf" "$migration_dropin"
+	systemctl daemon-reload
+	echo "Enabled legacy-token draining for the first signed-token upgrade."
+fi
+bash "$repository/deploy/ensure-token-key.sh"
 "$candidate" -config "$config" -profiles-file "$profiles" -check
 
 echo "Installing relay candidate"
@@ -121,3 +138,6 @@ else
 	echo "Health: ok; readiness: backend unavailable (unchanged from before update)"
 fi
 echo "Existing carrier sessions were invalidated; the hidden WebView will reconnect automatically."
+if [[ -f /etc/systemd/system/tproxy-server.service.d/token-migration.conf ]]; then
+	echo "After existing clients have reloaded, finish token migration as described in HARDENING.md."
+fi

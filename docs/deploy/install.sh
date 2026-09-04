@@ -7,11 +7,12 @@ secret=
 email=
 site_dir=
 site_upstream=
+static_routes=exact
 mtproxy_workers=1
 mtproxy_max_connections=4096
 
 usage() {
-	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--site-dir DIR | --site-upstream URL] [--secret 32-or-34-hex] [--mtproxy-workers 1] [--mtproxy-max-connections 4096]" >&2
+	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--site-dir DIR | --site-upstream URL] [--static-routes exact|legacy] [--secret 32-or-34-hex] [--mtproxy-workers 1] [--mtproxy-max-connections 4096]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -21,6 +22,7 @@ while [[ $# -gt 0 ]]; do
 		--email) email="${2:-}"; shift 2 ;;
 		--site-dir) site_dir="${2:-}"; shift 2 ;;
 		--site-upstream) site_upstream="${2:-}"; shift 2 ;;
+		--static-routes) static_routes="${2:-}"; shift 2 ;;
 		--mtproxy-workers) mtproxy_workers="${2:-}"; shift 2 ;;
 		--mtproxy-max-connections) mtproxy_max_connections="${2:-}"; shift 2 ;;
 		*) usage; exit 2 ;;
@@ -61,6 +63,10 @@ if [[ ! "$mtproxy_max_connections" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 repository="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "$static_routes" != exact && "$static_routes" != legacy ]]; then
+	echo "--static-routes must be exact or legacy" >&2
+	exit 2
+fi
 if [[ -n "$site_dir" ]] && [[ -n "$site_upstream" ]]; then
 	echo "--site-dir and --site-upstream are mutually exclusive" >&2
 	exit 2
@@ -167,12 +173,14 @@ else
 fi
 
 install -d -o root -g tproxy -m 0750 /etc/tproxy-server
+bash "$repository/deploy/ensure-token-key.sh"
 cat > /etc/tproxy-server/config.json <<EOF
 {
   "public_hostname": "$hostname",
   "listen": "127.0.0.1:8080",
   "admin_listen": "127.0.0.1:8081",
 $public_source
+  "static_routes": "$static_routes",
   "profiles_file": "/run/credentials/tproxy-server.service/profiles.json"
 }
 EOF

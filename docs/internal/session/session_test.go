@@ -42,7 +42,7 @@ func TestSequenceRetryAndMismatch(t *testing.T) {
 func TestLaneSequencesAndReplayAreIndependent(t *testing.T) {
 	configuration := testConfig("127.0.0.1:1")
 	configuration.Profiles[0].CarrierMode = config.CarrierHTTPSLanes
-	manager := NewManager(configuration)
+	manager := NewManager(configuration, [32]byte{1})
 	defer manager.Shutdown()
 	bootstrap, err := manager.IssueBootstrap(
 		&configuration.Profiles[0],
@@ -73,7 +73,7 @@ func TestLaneSequencesAndReplayAreIndependent(t *testing.T) {
 func TestLaneRejectsCrossStreamFrames(t *testing.T) {
 	configuration := testConfig("127.0.0.1:1")
 	configuration.Profiles[0].CarrierMode = config.CarrierHTTPSLanes
-	manager := NewManager(configuration)
+	manager := NewManager(configuration, [32]byte{1})
 	defer manager.Shutdown()
 	bootstrap, err := manager.IssueBootstrap(
 		&configuration.Profiles[0],
@@ -97,7 +97,7 @@ func TestLaneRejectsCrossStreamFrames(t *testing.T) {
 func TestClosedLaneReplaysDownlinkAndFinalUplink(t *testing.T) {
 	configuration := testConfig("127.0.0.1:1")
 	configuration.Profiles[0].CarrierMode = config.CarrierHTTPSLanes
-	manager := NewManager(configuration)
+	manager := NewManager(configuration, [32]byte{1})
 	defer manager.Shutdown()
 	bootstrap, err := manager.IssueBootstrap(
 		&configuration.Profiles[0],
@@ -227,7 +227,7 @@ func TestControlFramesUseReservedQueueHeadroom(t *testing.T) {
 	configuration.Limits.MaxPendingGlobal = configuration.Limits.MaxPendingPerSession
 	configuration.Limits.MaxPendingItemsGlobal = configuration.Limits.MaxPendingItemsPerSession
 	configuration.Limits.MaxSessionsGlobal = 1
-	manager := NewManager(configuration)
+	manager := NewManager(configuration, [32]byte{1})
 	defer manager.Shutdown()
 	value := newSession(sessionOptions{
 		profile:  &configuration.Profiles[0],
@@ -550,7 +550,7 @@ func TestSessionCloseStopsBackendGoroutines(t *testing.T) {
 	}()
 
 	configuration := testConfig(listener.Addr().String())
-	manager := NewManager(configuration)
+	manager := NewManager(configuration, [32]byte{1})
 	bootstrap, err := manager.IssueBootstrap(&configuration.Profiles[0], "198.51.100.10")
 	if err != nil {
 		t.Fatal(err)
@@ -609,7 +609,7 @@ func TestBackendEOFClosesOnlyItsStream(t *testing.T) {
 	}()
 
 	configuration := testConfig(listener.Addr().String())
-	manager := NewManager(configuration)
+	manager := NewManager(configuration, [32]byte{1})
 	defer manager.Shutdown()
 	bootstrap, err := manager.IssueBootstrap(&configuration.Profiles[0], "198.51.100.15")
 	if err != nil {
@@ -678,7 +678,7 @@ func TestBootstrapLimitsExpiryAndConsumption(t *testing.T) {
 	configuration.Limits.MaxBootstrapsGlobal = 3
 	configuration.Limits.NewBootstrapsBurst = 10
 	configuration.Limits.NewBootstrapsPerMinute = 600
-	manager := NewManager(configuration)
+	manager := NewManager(configuration, [32]byte{1})
 	defer manager.Shutdown()
 	profile := &configuration.Profiles[0]
 	first, err := manager.IssueBootstrap(profile, "198.51.100.11")
@@ -701,7 +701,7 @@ func TestBootstrapLimitsExpiryAndConsumption(t *testing.T) {
 	expiringConfig := testConfig("127.0.0.1:1")
 	expiringConfig.Limits.MaxBootstrapsPerIP = 1
 	expiringConfig.Timeouts.BootstrapLifetime = config.Duration(time.Millisecond)
-	expiring := NewManager(expiringConfig)
+	expiring := NewManager(expiringConfig, [32]byte{1})
 	defer expiring.Shutdown()
 	expired, err := expiring.IssueBootstrap(&expiringConfig.Profiles[0], "198.51.100.12")
 	if err != nil {
@@ -720,7 +720,7 @@ func TestBootstrapSurvivesChangingClientAddress(t *testing.T) {
 	configuration := testConfig("127.0.0.1:1")
 	configuration.Limits.MaxBootstrapsPerIP = 1
 	configuration.Limits.MaxSessionsPerIP = 1
-	manager := NewManager(configuration)
+	manager := NewManager(configuration, [32]byte{1})
 	defer manager.Shutdown()
 	profile := &configuration.Profiles[0]
 	bootstrap, err := manager.IssueBootstrap(profile, "198.51.100.31")
@@ -760,7 +760,7 @@ func TestBootstrapRateIsGlobal(t *testing.T) {
 	configuration.Limits.MaxBootstrapsGlobal = 10
 	configuration.Limits.NewBootstrapsBurst = 2
 	configuration.Limits.NewBootstrapsPerMinute = 1
-	manager := NewManager(configuration)
+	manager := NewManager(configuration, [32]byte{1})
 	defer manager.Shutdown()
 	profile := &configuration.Profiles[0]
 	if _, err := manager.IssueBootstrap(profile, "198.51.100.13"); err != nil {
@@ -779,7 +779,7 @@ func TestGlobalBootstrapPoolEvictsOldestUnusedEntry(t *testing.T) {
 	configuration.Limits.MaxBootstrapsGlobal = 2
 	configuration.Limits.NewBootstrapsBurst = 10
 	configuration.Limits.NewBootstrapsPerMinute = 600
-	manager := NewManager(configuration)
+	manager := NewManager(configuration, [32]byte{1})
 	defer manager.Shutdown()
 	profile := &configuration.Profiles[0]
 	oldest, err := manager.IssueBootstrap(profile, "198.51.100.13")
@@ -803,7 +803,7 @@ func TestDisabledPerIPSessionLimitAllowsSharedAddress(t *testing.T) {
 	configuration.Limits.MaxSessionsGlobal = 8
 	configuration.Limits.NewSessionsBurst = 8
 	configuration.Limits.NewSessionsPerMinute = 600
-	manager := NewManager(configuration)
+	manager := NewManager(configuration, [32]byte{1})
 	defer manager.Shutdown()
 	for index := 0; index != 5; index++ {
 		bootstrap, err := manager.IssueBootstrap(
@@ -833,7 +833,7 @@ func TestProfileSessionLimitDoesNotConsumeGlobalCapacity(t *testing.T) {
 		Backend:    "127.0.0.1:1",
 		Capability: config.DeriveCapability("proxy.example.com", secondSecret),
 	})
-	manager := NewManager(configuration)
+	manager := NewManager(configuration, [32]byte{1})
 	defer manager.Shutdown()
 	hello := frame.Encode(frame.Hello, 0, []byte{1})
 	firstBootstrap, err := manager.IssueBootstrap(
@@ -869,7 +869,7 @@ func TestSessionCreationRateIsGlobal(t *testing.T) {
 	configuration := testConfig("127.0.0.1:1")
 	configuration.Limits.NewSessionsBurst = 1
 	configuration.Limits.NewSessionsPerMinute = 1
-	manager := NewManager(configuration)
+	manager := NewManager(configuration, [32]byte{1})
 	defer manager.Shutdown()
 	hello := frame.Encode(frame.Hello, 0, []byte{1})
 	for index, clientIP := range []string{"198.51.100.25", "198.51.100.26"} {
@@ -895,7 +895,7 @@ func TestStreamLimitRejectsOnlyTheNewStream(t *testing.T) {
 	configuration.Limits.MaxBackendDialsInFlight = 1
 	configuration.Limits.NewStreamsBurst = 10
 	configuration.Limits.NewStreamsPerMinute = 600
-	manager := NewManager(configuration)
+	manager := NewManager(configuration, [32]byte{1})
 	defer manager.Shutdown()
 	bootstrap, err := manager.IssueBootstrap(
 		&configuration.Profiles[0],
@@ -948,7 +948,7 @@ func TestBackendDialLimitReopensAfterDialCompletes(t *testing.T) {
 	configuration.Limits.MaxBackendDialsInFlight = 1
 	configuration.Limits.NewStreamsBurst = 10
 	configuration.Limits.NewStreamsPerMinute = 600
-	manager := NewManager(configuration)
+	manager := NewManager(configuration, [32]byte{1})
 	defer manager.Shutdown()
 	profile := manager.MatchCapability(configuration.Profiles[0].Capability[:])
 	if profile == nil || !manager.acquireStream(profile) {
@@ -969,7 +969,7 @@ func TestBackendDialLimitReopensAfterDialCompletes(t *testing.T) {
 func testSession(t *testing.T) (*Manager, string, *Session) {
 	t.Helper()
 	value := testConfig("127.0.0.1:1")
-	manager := NewManager(value)
+	manager := NewManager(value, [32]byte{1})
 	bootstrap, err := manager.IssueBootstrap(&value.Profiles[0], "198.51.100.9")
 	if err != nil {
 		t.Fatal(err)
@@ -1008,7 +1008,7 @@ func TestEvictedLaneReleasesBudgetAndIgnoresLateFrames(t *testing.T) {
 	configuration := testConfig("127.0.0.1:1")
 	configuration.Profiles[0].CarrierMode = config.CarrierHTTPSLanes
 	configuration.Limits.MaxClosedStreamIDs = 4
-	manager := NewManager(configuration)
+	manager := NewManager(configuration, [32]byte{1})
 	defer manager.Shutdown()
 	bootstrap, err := manager.IssueBootstrap(
 		&configuration.Profiles[0],

@@ -77,7 +77,7 @@ func TestPublicFallbackAndCarrierRoundTrip(t *testing.T) {
 		"bridge=%" + hex.EncodeToString([]byte{capability[0]}) + capability[1:],
 	} {
 		fallback := perform(t, hosted.Client(), request(t, http.MethodGet, hosted.URL+"/?"+query, nil, ""))
-		if fallback.StatusCode != http.StatusOK || !bytes.Equal(readResponse(t, fallback), index) {
+		if fallback.StatusCode != http.StatusNotFound || bytes.Equal(readResponse(t, fallback), index) {
 			t.Fatal("augmented or duplicated valid bridge query did not return the public index")
 		}
 	}
@@ -737,8 +737,8 @@ func TestDynamicPublicUpstreamAndTransportCoexist(t *testing.T) {
 			t.Fatalf("public application did not receive the original Host: %q", got)
 		}
 		if i == len(requests)-1 &&
-			(strings.Contains(got, "Bearer") || strings.Contains(got, "opaque carrier data")) {
-			t.Fatalf("carrier credentials or body reached the public application: %q", got)
+			(!strings.Contains(got, "Bearer") || !strings.Contains(got, "opaque carrier data")) {
+			t.Fatalf("random credentials or public body were stripped: %q", got)
 		}
 	}
 }
@@ -809,6 +809,10 @@ func newConfiguredTestServer(
 		t.Fatal(err)
 	}
 	value := config.Defaults()
+	value.TokenKeyFile = filepath.Join(t.TempDir(), "token.key")
+	if err := os.WriteFile(value.TokenKeyFile, bytes.Repeat([]byte{1}, 32), 0600); err != nil {
+		t.Fatal(err)
+	}
 	value.PublicHostname = testHost
 	value.PublicDir = directory
 	value.Timeouts.LongPoll = config.Duration(500 * time.Millisecond)
